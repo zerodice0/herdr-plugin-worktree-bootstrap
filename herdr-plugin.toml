@@ -1,6 +1,6 @@
 id = "zerodice0.worktree-bootstrap"
 name = "Worktree Bootstrap"
-version = "0.2.0"
+version = "0.2.1"
 min_herdr_version = "0.7.0"
 description = "Bootstrap new worktrees and interactively review local branch cleanup after removal."
 platforms = ["linux", "macos"]

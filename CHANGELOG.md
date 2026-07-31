@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## [0.2.1] - 2026-07-31
+
+- Redesign branch cleanup review as a responsive terminal dialog with status badges and a separate force-delete warning card.
+- Follow Herdr built-in themes and supported `[theme.custom]` semantic color overrides.
+- Match Herdr light/dark sibling selection when `theme.auto_switch` is enabled.
+- Preserve plain-text output for non-TTY, `NO_COLOR`, narrow terminal, and theme-detection fallback cases.
+- Keep terminal backgrounds transparent so popup chrome remains consistent with the active Herdr client.
+
 ## [0.2.0] - 2026-07-31
 
 - Queue local branch cleanup after Herdr emits `worktree.removed`.

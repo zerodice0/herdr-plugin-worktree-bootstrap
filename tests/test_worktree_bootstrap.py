@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import subprocess
@@ -99,6 +100,141 @@ class ContextResolverTests(unittest.TestCase):
     def test_invalid_environment_json_is_reported(self):
         with self.assertRaises(plugin.BootstrapError):
             plugin.resolve_target_path(None, {"HERDR_PLUGIN_CONTEXT_JSON": "{"})
+
+
+class ThemeRenderingTests(unittest.TestCase):
+    def inspection(self, **overrides):
+        values = {
+            "repo_root": Path("/tmp/프로젝트"),
+            "branch": "feature/theme-dialog",
+            "exists": True,
+            "protected": False,
+            "protection_reason": None,
+            "used_by_worktrees": (),
+            "default_ref": "main",
+            "merged_into_default": True,
+            "upstream": "origin/feature/theme-dialog",
+            "ahead": 0,
+            "behind": 0,
+            "last_commit": "abc1234 Polish cleanup dialog",
+            "head_oid": "a" * 40,
+        }
+        values.update(overrides)
+        return plugin.BranchInspection(**values)
+
+    def test_loads_herdr_theme_and_custom_overrides_without_full_toml_dependency(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "config.toml"
+            config.write_text(
+                """
+[theme]
+name = "tokyo-night" # active theme
+auto_switch = true
+dark_name = 'dracula'
+light_name = "tokyo-night-day"
+
+[theme.custom]
+accent = "#abcdef"
+red = "rgb(200, 10, 20)"
+
+[ui]
+accent = "cyan"
+""",
+                encoding="utf-8",
+            )
+            settings = plugin.load_theme_settings({}, config_path=config)
+        self.assertEqual(settings.name, "tokyo-night")
+        self.assertTrue(settings.auto_switch)
+        self.assertEqual(settings.dark_name, "dracula")
+        self.assertEqual(settings.light_name, "tokyo-night-day")
+        self.assertEqual(settings.custom["accent"], "#abcdef")
+        self.assertEqual(settings.custom["red"], "rgb(200, 10, 20)")
+        self.assertEqual(settings.legacy_accent, "cyan")
+
+    def test_missing_or_unreadable_theme_config_uses_catppuccin(self):
+        settings = plugin.load_theme_settings({}, config_path=Path("/does/not/exist"))
+        palette = plugin.resolve_theme_palette(settings)
+        self.assertEqual(palette.name, "catppuccin")
+        self.assertEqual(palette.accent, (137, 180, 250))
+
+    def test_auto_switch_uses_same_light_dark_sibling_names_as_herdr(self):
+        settings = plugin.ThemeSettings(name="tokyo-night", auto_switch=True)
+        self.assertEqual(
+            plugin.resolve_theme_palette(settings, appearance="dark").name,
+            "tokyo-night",
+        )
+        light = plugin.resolve_theme_palette(settings, appearance="light")
+        self.assertEqual(light.name, "tokyo-night-day")
+        self.assertEqual(light.accent, (46, 125, 233))
+
+    def test_custom_colors_override_semantic_palette_and_ignore_invalid_values(self):
+        settings = plugin.ThemeSettings(
+            name="nord",
+            custom={"accent": "#abc", "red": "rgb(1, 2, 3)", "green": "invalid"},
+        )
+        palette = plugin.resolve_theme_palette(settings)
+        self.assertEqual(palette.accent, (170, 187, 204))
+        self.assertEqual(palette.danger, (1, 2, 3))
+        self.assertEqual(palette.positive, (163, 190, 140))
+
+    def test_terminal_background_response_drives_auto_switch_appearance(self):
+        self.assertEqual(
+            plugin._appearance_from_terminal_response("\x1b]11;rgb:1111/2222/3333\x1b\\"),
+            "dark",
+        )
+        self.assertEqual(
+            plugin._appearance_from_terminal_response("\x1b]11;#f0f0f0\x07"),
+            "light",
+        )
+        self.assertIsNone(plugin._appearance_from_terminal_response("not an OSC response"))
+
+    def test_themed_dialog_uses_tokyo_night_colors_and_respects_display_width(self):
+        palette = plugin.resolve_theme_palette(plugin.ThemeSettings(name="tokyo-night"))
+        lines = plugin.render_cleanup_dialog(
+            self.inspection(),
+            {"worktree_path": "/tmp/프로젝트 worktree", "forced_worktree_removal": False},
+            palette,
+            columns=72,
+            decorated=True,
+            color_enabled=True,
+        )
+        rendered = "\n".join(lines)
+        self.assertIn("\033[38;2;122;162;247m", rendered)
+        self.assertIn("MERGED", rendered)
+        self.assertIn("Remote branches are never changed", rendered)
+        ansi = re.compile(r"\x1b\[[0-9;]*m")
+        for line in lines:
+            visible = ansi.sub("", line)
+            self.assertLessEqual(plugin._display_width(visible), 72)
+
+    def test_non_tty_dialog_remains_plain_and_log_friendly(self):
+        palette = plugin.resolve_theme_palette(plugin.ThemeSettings(name="tokyo-night"))
+        lines = plugin.render_cleanup_dialog(
+            self.inspection(protected=True),
+            {"worktree_path": "/tmp/worktree", "forced_worktree_removal": False},
+            palette,
+            columns=80,
+            decorated=False,
+            color_enabled=False,
+        )
+        rendered = "\n".join(lines)
+        self.assertIn("Deletion blocked", rendered)
+        self.assertNotIn("\x1b", rendered)
+        self.assertNotIn("╭", rendered)
+
+    def test_force_delete_dialog_has_separate_destructive_confirmation_card(self):
+        palette = plugin.resolve_theme_palette(plugin.ThemeSettings(name="dracula"))
+        lines = plugin.render_force_delete_dialog(
+            self.inspection(merged_into_default=False),
+            palette,
+            columns=70,
+            decorated=True,
+            color_enabled=False,
+        )
+        rendered = "\n".join(lines)
+        self.assertIn("Destructive action", rendered)
+        self.assertIn("feature/theme-dialog", rendered)
+        self.assertIn("╭─ Force delete", rendered)
 
 
 class GitRepositoryTestCase(unittest.TestCase):

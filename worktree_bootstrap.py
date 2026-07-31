@@ -17,13 +17,18 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
+import select
 import shutil
 import signal
 import stat
 import subprocess
 import sys
 import tempfile
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+import termios
+import time
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+import unicodedata
 import uuid
 
 
@@ -34,6 +39,8 @@ TXN_PREFIX = ".herdr-worktree-bootstrap-txn-"
 BRANCH_CLEANUP_DIR = "branch-cleanup"
 WORKTREE_MAP_DIR = "worktree-map"
 PROTECTED_BRANCHES = frozenset({"main", "master", "develop", "development", "trunk"})
+ANSI_RESET = "\033[0m"
+ColorValue = Optional[Union[int, Tuple[int, int, int]]]
 
 
 class BootstrapError(RuntimeError):
@@ -110,6 +117,442 @@ class BranchInspection:
     behind: Optional[int]
     last_commit: Optional[str]
     head_oid: Optional[str]
+
+
+@dataclasses.dataclass(frozen=True)
+class ThemeSettings:
+    name: str = "catppuccin"
+    auto_switch: bool = False
+    dark_name: Optional[str] = None
+    light_name: Optional[str] = None
+    custom: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    legacy_accent: Optional[str] = None
+
+
+@dataclasses.dataclass(frozen=True)
+class ThemePalette:
+    name: str
+    accent: ColorValue
+    text: ColorValue
+    muted: ColorValue
+    subtle: ColorValue
+    branch: ColorValue
+    positive: ColorValue
+    warning: ColorValue
+    danger: ColorValue
+    info: ColorValue
+    peach: ColorValue
+
+
+def _rgb(red: int, green: int, blue: int) -> Tuple[int, int, int]:
+    return red, green, blue
+
+
+# Semantic colors mirror Herdr 0.7.5's built-in Palette definitions.  The
+# dialog deliberately leaves its background at the terminal default so the
+# session-modal popup keeps the active client's background and border chrome.
+HERDR_THEME_PALETTES: Mapping[str, ThemePalette] = {
+    "catppuccin": ThemePalette(
+        "catppuccin", _rgb(137, 180, 250), _rgb(205, 214, 244),
+        _rgb(166, 173, 200), _rgb(127, 132, 156), _rgb(203, 166, 247),
+        _rgb(166, 227, 161), _rgb(249, 226, 175), _rgb(243, 139, 168),
+        _rgb(137, 180, 250), _rgb(250, 179, 135),
+    ),
+    "catppuccin-latte": ThemePalette(
+        "catppuccin-latte", _rgb(30, 102, 245), _rgb(76, 79, 105),
+        _rgb(108, 111, 133), _rgb(140, 143, 161), _rgb(136, 57, 239),
+        _rgb(64, 160, 43), _rgb(223, 142, 29), _rgb(210, 15, 57),
+        _rgb(30, 102, 245), _rgb(254, 100, 11),
+    ),
+    "terminal": ThemePalette(
+        "terminal", 34, None, 90, 37, 35, 32, 33, 91, 34, 33,
+    ),
+    "tokyo-night": ThemePalette(
+        "tokyo-night", _rgb(122, 162, 247), _rgb(192, 202, 245),
+        _rgb(169, 177, 214), _rgb(105, 113, 150), _rgb(187, 154, 247),
+        _rgb(158, 206, 106), _rgb(224, 175, 104), _rgb(247, 118, 142),
+        _rgb(122, 162, 247), _rgb(255, 158, 100),
+    ),
+    "tokyo-night-day": ThemePalette(
+        "tokyo-night-day", _rgb(46, 125, 233), _rgb(55, 96, 191),
+        _rgb(97, 114, 176), _rgb(104, 112, 154), _rgb(120, 71, 189),
+        _rgb(88, 117, 57), _rgb(140, 108, 62), _rgb(245, 42, 101),
+        _rgb(46, 125, 233), _rgb(177, 92, 0),
+    ),
+    "dracula": ThemePalette(
+        "dracula", _rgb(189, 147, 249), _rgb(248, 248, 242),
+        _rgb(210, 210, 220), _rgb(130, 140, 180), _rgb(255, 121, 198),
+        _rgb(80, 250, 123), _rgb(241, 250, 140), _rgb(255, 85, 85),
+        _rgb(139, 233, 253), _rgb(255, 184, 108),
+    ),
+    "nord": ThemePalette(
+        "nord", _rgb(136, 192, 208), _rgb(236, 239, 244),
+        _rgb(216, 222, 233), _rgb(100, 110, 130), _rgb(180, 142, 173),
+        _rgb(163, 190, 140), _rgb(235, 203, 139), _rgb(191, 97, 106),
+        _rgb(129, 161, 193), _rgb(208, 135, 112),
+    ),
+    "gruvbox": ThemePalette(
+        "gruvbox", _rgb(215, 153, 33), _rgb(235, 219, 178),
+        _rgb(213, 196, 161), _rgb(168, 153, 132), _rgb(211, 134, 155),
+        _rgb(184, 187, 38), _rgb(250, 189, 47), _rgb(251, 73, 52),
+        _rgb(131, 165, 152), _rgb(254, 128, 25),
+    ),
+    "gruvbox-light": ThemePalette(
+        "gruvbox-light", _rgb(7, 102, 120), _rgb(60, 56, 54),
+        _rgb(80, 73, 69), _rgb(124, 111, 100), _rgb(143, 63, 113),
+        _rgb(121, 116, 14), _rgb(181, 118, 20), _rgb(157, 0, 6),
+        _rgb(7, 102, 120), _rgb(175, 58, 3),
+    ),
+    "one-dark": ThemePalette(
+        "one-dark", _rgb(97, 175, 239), _rgb(171, 178, 191),
+        _rgb(150, 156, 168), _rgb(115, 122, 135), _rgb(198, 120, 221),
+        _rgb(152, 195, 121), _rgb(229, 192, 123), _rgb(224, 108, 117),
+        _rgb(97, 175, 239), _rgb(209, 154, 102),
+    ),
+    "one-light": ThemePalette(
+        "one-light", _rgb(64, 120, 242), _rgb(56, 58, 66),
+        _rgb(104, 107, 119), _rgb(104, 107, 119), _rgb(166, 38, 164),
+        _rgb(80, 161, 79), _rgb(193, 132, 1), _rgb(228, 86, 73),
+        _rgb(64, 120, 242), _rgb(152, 104, 1),
+    ),
+    "solarized": ThemePalette(
+        "solarized", _rgb(38, 139, 210), _rgb(147, 161, 161),
+        _rgb(131, 148, 150), _rgb(101, 123, 131), _rgb(211, 54, 130),
+        _rgb(133, 153, 0), _rgb(181, 137, 0), _rgb(220, 50, 47),
+        _rgb(38, 139, 210), _rgb(203, 75, 22),
+    ),
+    "solarized-light": ThemePalette(
+        "solarized-light", _rgb(38, 139, 210), _rgb(101, 123, 131),
+        _rgb(131, 148, 150), _rgb(88, 110, 117), _rgb(211, 54, 130),
+        _rgb(133, 153, 0), _rgb(181, 137, 0), _rgb(220, 50, 47),
+        _rgb(38, 139, 210), _rgb(203, 75, 22),
+    ),
+    "kanagawa": ThemePalette(
+        "kanagawa", _rgb(126, 156, 216), _rgb(220, 215, 186),
+        _rgb(200, 195, 170), _rgb(135, 134, 125), _rgb(149, 127, 184),
+        _rgb(118, 148, 106), _rgb(192, 163, 110), _rgb(195, 64, 67),
+        _rgb(126, 156, 216), _rgb(255, 160, 102),
+    ),
+    "kanagawa-lotus": ThemePalette(
+        "kanagawa-lotus", _rgb(77, 105, 155), _rgb(84, 84, 100),
+        _rgb(67, 67, 108), _rgb(138, 137, 128), _rgb(98, 76, 131),
+        _rgb(111, 137, 78), _rgb(119, 113, 63), _rgb(200, 64, 83),
+        _rgb(77, 105, 155), _rgb(204, 109, 0),
+    ),
+    "rose-pine": ThemePalette(
+        "rose-pine", _rgb(196, 167, 231), _rgb(224, 222, 244),
+        _rgb(200, 197, 220), _rgb(144, 140, 170), _rgb(196, 167, 231),
+        _rgb(49, 116, 143), _rgb(246, 193, 119), _rgb(235, 111, 146),
+        _rgb(49, 116, 143), _rgb(234, 154, 151),
+    ),
+    "rose-pine-dawn": ThemePalette(
+        "rose-pine-dawn", _rgb(144, 122, 169), _rgb(70, 66, 97),
+        _rgb(121, 117, 147), _rgb(121, 117, 147), _rgb(144, 122, 169),
+        _rgb(40, 105, 131), _rgb(234, 157, 52), _rgb(180, 99, 122),
+        _rgb(40, 105, 131), _rgb(215, 130, 126),
+    ),
+    "vesper": ThemePalette(
+        "vesper", _rgb(255, 199, 153), _rgb(255, 255, 255),
+        _rgb(160, 160, 160), _rgb(126, 126, 126), _rgb(255, 209, 168),
+        _rgb(153, 255, 228), _rgb(255, 199, 153), _rgb(255, 128, 128),
+        _rgb(176, 176, 176), _rgb(255, 199, 153),
+    ),
+}
+
+
+HERDR_THEME_ALIASES: Mapping[str, str] = {
+    "catppuccin-mocha": "catppuccin",
+    "latte": "catppuccin-latte",
+    "light": "catppuccin-latte",
+    "tokyonight": "tokyo-night",
+    "tokyo-day": "tokyo-night-day",
+    "tokyonight-day": "tokyo-night-day",
+    "gruvbox-dark": "gruvbox",
+    "onedark": "one-dark",
+    "onelight": "one-light",
+    "solarized-dark": "solarized",
+    "lotus": "kanagawa-lotus",
+    "rosepine": "rose-pine",
+    "rosepine-dawn": "rose-pine-dawn",
+    "dawn": "rose-pine-dawn",
+}
+
+
+THEME_CUSTOM_TO_PALETTE: Mapping[str, str] = {
+    "accent": "accent",
+    "text": "text",
+    "subtext0": "muted",
+    "overlay1": "subtle",
+    "mauve": "branch",
+    "green": "positive",
+    "yellow": "warning",
+    "red": "danger",
+    "blue": "info",
+    "peach": "peach",
+}
+
+NAMED_THEME_COLORS: Mapping[str, int] = {
+    "black": 30,
+    "red": 31,
+    "green": 32,
+    "yellow": 33,
+    "blue": 34,
+    "magenta": 35,
+    "purple": 35,
+    "cyan": 36,
+    "white": 37,
+    "gray": 37,
+    "grey": 37,
+    "darkgray": 90,
+    "darkgrey": 90,
+    "lightred": 91,
+    "lightgreen": 92,
+    "lightyellow": 93,
+    "lightblue": 94,
+    "lightmagenta": 95,
+    "lightcyan": 96,
+}
+
+_INVALID_THEME_COLOR = object()
+
+
+def _normalize_theme_name(value: str) -> str:
+    return value.strip().lower().replace(" ", "-").replace("_", "-")
+
+
+def _strip_toml_comment(line: str) -> str:
+    quote: Optional[str] = None
+    escaped = False
+    result: List[str] = []
+    for character in line:
+        if escaped:
+            result.append(character)
+            escaped = False
+            continue
+        if quote == '"' and character == "\\":
+            result.append(character)
+            escaped = True
+            continue
+        if character in ("'", '"'):
+            if quote is None:
+                quote = character
+            elif quote == character:
+                quote = None
+            result.append(character)
+            continue
+        if character == "#" and quote is None:
+            break
+        result.append(character)
+    return "".join(result).strip()
+
+
+def _parse_theme_scalar(value: str) -> Optional[Union[str, bool]]:
+    value = value.strip()
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    if len(value) >= 2 and value[0] == value[-1] == "'":
+        return value[1:-1]
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        return parsed if isinstance(parsed, str) else None
+    return None
+
+
+def _theme_config_path(env: Mapping[str, str]) -> Path:
+    configured = env.get("HERDR_CONFIG_PATH")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".config" / "herdr" / "config.toml"
+
+
+def load_theme_settings(
+    env: Mapping[str, str],
+    *,
+    config_path: Optional[Path] = None,
+) -> ThemeSettings:
+    path = config_path if config_path is not None else _theme_config_path(env)
+    try:
+        contents = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return ThemeSettings()
+
+    section = ""
+    values: Dict[str, Union[str, bool]] = {}
+    custom: Dict[str, str] = {}
+    legacy_accent: Optional[str] = None
+    for raw_line in contents.splitlines():
+        line = _strip_toml_comment(raw_line)
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip()
+            continue
+        if "=" not in line:
+            continue
+        raw_key, raw_value = line.split("=", 1)
+        key = raw_key.strip()
+        parsed = _parse_theme_scalar(raw_value)
+        if parsed is None:
+            continue
+        if section == "theme" and key in ("name", "auto_switch", "dark_name", "light_name"):
+            values[key] = parsed
+        elif section == "theme.custom" and key in THEME_CUSTOM_TO_PALETTE:
+            if isinstance(parsed, str):
+                custom[key] = parsed
+        elif section == "ui" and key == "accent" and isinstance(parsed, str):
+            legacy_accent = parsed
+
+    name = values.get("name")
+    auto_switch = values.get("auto_switch")
+    dark_name = values.get("dark_name")
+    light_name = values.get("light_name")
+    return ThemeSettings(
+        name=name if isinstance(name, str) and name.strip() else "catppuccin",
+        auto_switch=auto_switch if isinstance(auto_switch, bool) else False,
+        dark_name=dark_name if isinstance(dark_name, str) and dark_name.strip() else None,
+        light_name=light_name if isinstance(light_name, str) and light_name.strip() else None,
+        custom=custom,
+        legacy_accent=legacy_accent,
+    )
+
+
+def _theme_siblings(name: str) -> Tuple[str, str]:
+    normalized = HERDR_THEME_ALIASES.get(_normalize_theme_name(name), _normalize_theme_name(name))
+    if normalized in ("catppuccin", "catppuccin-latte"):
+        return "catppuccin", "catppuccin-latte"
+    if normalized in ("tokyo-night", "tokyo-night-day"):
+        return "tokyo-night", "tokyo-night-day"
+    if normalized in ("gruvbox", "gruvbox-light"):
+        return "gruvbox", "gruvbox-light"
+    if normalized in ("one-dark", "one-light"):
+        return "one-dark", "one-light"
+    if normalized in ("solarized", "solarized-light"):
+        return "solarized", "solarized-light"
+    if normalized in ("kanagawa", "kanagawa-lotus"):
+        return "kanagawa", "kanagawa-lotus"
+    if normalized in ("rose-pine", "rose-pine-dawn"):
+        return "rose-pine", "rose-pine-dawn"
+    return normalized, normalized
+
+
+def _parse_theme_color(value: str) -> Any:
+    normalized = value.strip().lower()
+    if normalized in ("reset", "default", "none", "transparent"):
+        return None
+    if normalized in NAMED_THEME_COLORS:
+        return NAMED_THEME_COLORS[normalized]
+    if normalized.startswith("#"):
+        hexadecimal = normalized[1:]
+        if len(hexadecimal) == 3 and all(character in "0123456789abcdef" for character in hexadecimal):
+            return tuple(int(character * 2, 16) for character in hexadecimal)
+        if len(hexadecimal) == 6 and all(character in "0123456789abcdef" for character in hexadecimal):
+            return tuple(int(hexadecimal[index:index + 2], 16) for index in (0, 2, 4))
+        return _INVALID_THEME_COLOR
+    match = re.fullmatch(r"rgb\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)", normalized)
+    if match:
+        components = tuple(int(component) for component in match.groups())
+        return components if all(component <= 255 for component in components) else _INVALID_THEME_COLOR
+    return _INVALID_THEME_COLOR
+
+
+def resolve_theme_palette(
+    settings: ThemeSettings,
+    *,
+    appearance: Optional[str] = None,
+) -> ThemePalette:
+    requested_name = settings.name
+    fallback_name = "catppuccin"
+    if settings.auto_switch:
+        dark_name, light_name = _theme_siblings(settings.name)
+        if appearance == "light":
+            requested_name = settings.light_name or light_name
+            fallback_name = "catppuccin-latte"
+        else:
+            requested_name = settings.dark_name or dark_name
+    normalized = _normalize_theme_name(requested_name)
+    normalized = HERDR_THEME_ALIASES.get(normalized, normalized)
+    palette = HERDR_THEME_PALETTES.get(normalized, HERDR_THEME_PALETTES[fallback_name])
+
+    replacements: Dict[str, ColorValue] = {}
+    for custom_name, value in settings.custom.items():
+        parsed = _parse_theme_color(value)
+        if parsed is not _INVALID_THEME_COLOR:
+            replacements[THEME_CUSTOM_TO_PALETTE[custom_name]] = parsed
+    if "accent" not in replacements and settings.legacy_accent:
+        parsed_accent = _parse_theme_color(settings.legacy_accent)
+        if parsed_accent is not _INVALID_THEME_COLOR:
+            replacements["accent"] = parsed_accent
+    if replacements:
+        palette = dataclasses.replace(palette, **replacements)
+    return dataclasses.replace(palette, name=normalized if normalized in HERDR_THEME_PALETTES else fallback_name)
+
+
+def _parse_terminal_rgb_component(value: str) -> Optional[int]:
+    if not value or len(value) > 4 or any(character not in "0123456789abcdefABCDEF" for character in value):
+        return None
+    raw = int(value, 16)
+    maximum = (1 << (len(value) * 4)) - 1
+    return (raw * 255 + maximum // 2) // maximum
+
+
+def _appearance_from_terminal_response(response: str) -> Optional[str]:
+    match = re.search(r"\x1b\]11;rgb:([^/]+)/([^/]+)/([^\x07\x1b]+)(?:\x07|\x1b\\)", response)
+    if not match:
+        match = re.search(r"\x1b\]11;#([0-9a-fA-F]{6})(?:\x07|\x1b\\)", response)
+        if not match:
+            return None
+        hexadecimal = match.group(1)
+        red, green, blue = (int(hexadecimal[index:index + 2], 16) for index in (0, 2, 4))
+    else:
+        components = tuple(_parse_terminal_rgb_component(value) for value in match.groups())
+        if any(component is None for component in components):
+            return None
+        red, green, blue = components  # type: ignore[misc]
+    luminance = red * 299 + green * 587 + blue * 114
+    return "light" if luminance >= 128_000 else "dark"
+
+
+def query_terminal_appearance(timeout_seconds: float = 0.15) -> Optional[str]:
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        return None
+    input_fd = sys.stdin.fileno()
+    try:
+        original = termios.tcgetattr(input_fd)
+    except (OSError, termios.error):
+        return None
+    collected = bytearray()
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        updated = list(original)
+        updated[3] &= ~(termios.ICANON | termios.ECHO)
+        updated[6][termios.VMIN] = 0
+        updated[6][termios.VTIME] = 0
+        termios.tcsetattr(input_fd, termios.TCSANOW, updated)
+        sys.stdout.write("\033]11;?\033\\")
+        sys.stdout.flush()
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([input_fd], [], [], max(0.0, deadline - time.monotonic()))
+            if not ready:
+                break
+            chunk = os.read(input_fd, 256)
+            if not chunk:
+                break
+            collected.extend(chunk)
+            decoded = collected.decode("ascii", errors="ignore")
+            appearance = _appearance_from_terminal_response(decoded)
+            if appearance:
+                return appearance
+    except (OSError, termios.error):
+        return None
+    finally:
+        with contextlib.suppress(OSError, termios.error):
+            termios.tcsetattr(input_fd, termios.TCSANOW, original)
+    return None
 
 
 def _run_git(
@@ -984,13 +1427,355 @@ def _safe_terminal_text(value: Any, limit: int = 240) -> str:
     return " ".join(sanitized.split())[:limit]
 
 
+@dataclasses.dataclass(frozen=True)
+class StyledSegment:
+    text: str
+    role: str = "text"
+    bold: bool = False
+    dim: bool = False
+
+
+def _display_width(value: str) -> int:
+    width = 0
+    for character in value:
+        if unicodedata.combining(character):
+            continue
+        width += 2 if unicodedata.east_asian_width(character) in ("W", "F") else 1
+    return width
+
+
+def _truncate_display(value: str, maximum: int) -> str:
+    if maximum <= 0:
+        return ""
+    if _display_width(value) <= maximum:
+        return value
+    if maximum == 1:
+        return "…"
+    result: List[str] = []
+    used = 0
+    target = maximum - 1
+    for character in value:
+        character_width = 0 if unicodedata.combining(character) else (
+            2 if unicodedata.east_asian_width(character) in ("W", "F") else 1
+        )
+        if used + character_width > target:
+            break
+        result.append(character)
+        used += character_width
+    return "".join(result) + "…"
+
+
+def _ansi_foreground(color: ColorValue) -> str:
+    if color is None:
+        return "\033[39m"
+    if isinstance(color, int):
+        return f"\033[{color}m"
+    red, green, blue = color
+    return f"\033[38;2;{red};{green};{blue}m"
+
+
+def _style_text(
+    value: str,
+    palette: ThemePalette,
+    role: str,
+    *,
+    enabled: bool,
+    bold: bool = False,
+    dim: bool = False,
+) -> str:
+    if not enabled:
+        return value
+    color = getattr(palette, role)
+    attributes = ("\033[1m" if bold else "") + ("\033[2m" if dim else "")
+    return f"{_ansi_foreground(color)}{attributes}{value}{ANSI_RESET}"
+
+
+def _fit_segments(segments: Sequence[StyledSegment], maximum: int) -> List[StyledSegment]:
+    fitted: List[StyledSegment] = []
+    remaining = maximum
+    for segment in segments:
+        if remaining <= 0:
+            break
+        text = _truncate_display(segment.text, remaining)
+        fitted.append(dataclasses.replace(segment, text=text))
+        consumed = _display_width(text)
+        remaining -= consumed
+        if text != segment.text:
+            break
+    return fitted
+
+
+def _box_row(
+    segments: Sequence[StyledSegment],
+    width: int,
+    palette: ThemePalette,
+    *,
+    color_enabled: bool,
+) -> str:
+    inner_width = width - 4
+    fitted = _fit_segments(segments, inner_width)
+    visible_width = sum(_display_width(segment.text) for segment in fitted)
+    content = "".join(
+        _style_text(
+            segment.text,
+            palette,
+            segment.role,
+            enabled=color_enabled,
+            bold=segment.bold,
+            dim=segment.dim,
+        )
+        for segment in fitted
+    )
+    border = _style_text("│", palette, "accent", enabled=color_enabled)
+    return f"{border} {content}{' ' * max(0, inner_width - visible_width)} {border}"
+
+
+def _box_border(
+    width: int,
+    palette: ThemePalette,
+    *,
+    color_enabled: bool,
+    title: Optional[str] = None,
+    bottom: bool = False,
+) -> str:
+    if bottom:
+        value = "╰" + "─" * (width - 2) + "╯"
+    elif title:
+        prefix = f"╭─ {title} "
+        value = prefix + "─" * max(0, width - _display_width(prefix) - 1) + "╮"
+    else:
+        value = "├" + "─" * (width - 2) + "┤"
+    return _style_text(value, palette, "accent", enabled=color_enabled, bold=bool(title))
+
+
+def _friendly_path(value: Any) -> str:
+    text = _safe_terminal_text(value)
+    home = os.fspath(Path.home())
+    if text == home:
+        return "~"
+    if text.startswith(home + os.sep):
+        return "~" + text[len(home):]
+    return text
+
+
+def _cleanup_status(inspection: BranchInspection) -> Tuple[str, str]:
+    if inspection.protected:
+        return "PROTECTED · deletion blocked", "danger"
+    if inspection.used_by_worktrees:
+        return "IN USE · deletion blocked", "warning"
+    if inspection.merged_into_default is True:
+        return f"MERGED · {inspection.default_ref or 'default'}", "positive"
+    if inspection.merged_into_default is False:
+        return f"UNMERGED · {inspection.default_ref or 'default'}", "warning"
+    return "MERGE STATUS UNKNOWN", "warning"
+
+
+def _plain_cleanup_dialog(
+    inspection: BranchInspection,
+    record: Mapping[str, Any],
+) -> List[str]:
+    lines = [
+        "Herdr branch cleanup review",
+        "",
+        f"Repository: {_safe_terminal_text(inspection.repo_root)}",
+        f"Removed worktree: {_safe_terminal_text(record.get('worktree_path', 'unknown'))}",
+        f"Branch: {_safe_terminal_text(inspection.branch)}",
+        f"Last commit: {_safe_terminal_text(inspection.last_commit or 'unknown')}",
+        f"Default branch ref: {_safe_terminal_text(inspection.default_ref or 'unknown')}",
+        f"Merged into default: {_yes_no_unknown(inspection.merged_into_default)}",
+        f"Upstream: {_safe_terminal_text(inspection.upstream or 'none')}",
+    ]
+    if inspection.ahead is not None and inspection.behind is not None:
+        lines.append(f"Upstream distance: ahead {inspection.ahead}, behind {inspection.behind}")
+    lines.append("Remote branches are never deleted by this plugin.")
+    if record.get("forced_worktree_removal"):
+        lines.append("Warning: the worktree itself was removed with --force.")
+    if inspection.protected:
+        lines.append("Deletion blocked: this is a protected/default branch.")
+    if inspection.used_by_worktrees:
+        lines.append("Deletion blocked: branch is used by another worktree:")
+        lines.extend(f"  {_safe_terminal_text(path)}" for path in inspection.used_by_worktrees)
+    return lines
+
+
+def render_cleanup_dialog(
+    inspection: BranchInspection,
+    record: Mapping[str, Any],
+    palette: ThemePalette,
+    *,
+    columns: int,
+    decorated: bool,
+    color_enabled: bool,
+) -> List[str]:
+    if not decorated or columns < 48:
+        return _plain_cleanup_dialog(inspection, record)
+
+    width = max(48, min(columns - 2, 88))
+    status, status_role = _cleanup_status(inspection)
+    lines = [
+        _box_border(width, palette, color_enabled=color_enabled, title="Branch cleanup"),
+        _box_row([], width, palette, color_enabled=color_enabled),
+        _box_row(
+            [StyledSegment("✓ ", "positive", bold=True), StyledSegment("Worktree removed", "text", bold=True)],
+            width,
+            palette,
+            color_enabled=color_enabled,
+        ),
+        _box_row([], width, palette, color_enabled=color_enabled),
+    ]
+
+    def detail(label: str, value: str, role: str = "text", bold: bool = False) -> None:
+        lines.append(
+            _box_row(
+                [StyledSegment(f"{label:<13}", "muted"), StyledSegment(value, role, bold=bold)],
+                width,
+                palette,
+                color_enabled=color_enabled,
+            )
+        )
+
+    detail("Repository", _friendly_path(inspection.repo_root))
+    detail("Worktree", _friendly_path(record.get("worktree_path", "unknown")))
+    detail("Branch", _safe_terminal_text(inspection.branch), "branch", True)
+    detail("Status", status, status_role, True)
+    detail("Last commit", _safe_terminal_text(inspection.last_commit or "unknown"))
+    if inspection.upstream:
+        upstream = _safe_terminal_text(inspection.upstream)
+        if inspection.ahead is not None and inspection.behind is not None:
+            upstream += f" · ahead {inspection.ahead}, behind {inspection.behind}"
+        detail("Upstream", upstream)
+
+    lines.append(_box_row([], width, palette, color_enabled=color_enabled))
+    if record.get("forced_worktree_removal"):
+        lines.append(
+            _box_row(
+                [StyledSegment("! Worktree removal was forced.", "peach", bold=True)],
+                width,
+                palette,
+                color_enabled=color_enabled,
+            )
+        )
+    if inspection.protected:
+        advice = StyledSegment("This protected/default branch cannot be deleted here.", "danger", bold=True)
+    elif inspection.used_by_worktrees:
+        advice = StyledSegment("This branch is still checked out in another worktree.", "warning", bold=True)
+    elif inspection.merged_into_default is True:
+        advice = StyledSegment("This local branch can be deleted safely.", "positive", bold=True)
+    elif inspection.merged_into_default is False:
+        advice = StyledSegment("Unmerged commits may be lost by force deletion.", "warning", bold=True)
+    else:
+        advice = StyledSegment("Review this branch before choosing deletion.", "warning", bold=True)
+    lines.append(_box_row([advice], width, palette, color_enabled=color_enabled))
+    lines.append(
+        _box_row(
+            [StyledSegment("Remote branches are never changed.", "subtle", dim=True)],
+            width,
+            palette,
+            color_enabled=color_enabled,
+        )
+    )
+    for path in inspection.used_by_worktrees:
+        lines.append(
+            _box_row(
+                [StyledSegment("↳ ", "warning"), StyledSegment(_friendly_path(path), "muted")],
+                width,
+                palette,
+                color_enabled=color_enabled,
+            )
+        )
+
+    lines.append(_box_border(width, palette, color_enabled=color_enabled))
+    blocked = inspection.protected or bool(inspection.used_by_worktrees)
+    if blocked:
+        primary_actions = [
+            StyledSegment("ENTER", "accent", bold=True), StyledSegment(" Keep    ", "text"),
+            StyledSegment("S", "accent", bold=True), StyledSegment(" Later    ", "text"),
+            StyledSegment("Q", "accent", bold=True), StyledSegment(" Close", "text"),
+        ]
+        secondary_actions: List[StyledSegment] = []
+    else:
+        primary_actions = [
+            StyledSegment("ENTER", "accent", bold=True), StyledSegment(" Keep    ", "text"),
+            StyledSegment("D", "positive", bold=True), StyledSegment(" Delete safely", "text"),
+        ]
+        secondary_actions = [
+            StyledSegment("F", "danger", bold=True), StyledSegment(" Force…    ", "text"),
+            StyledSegment("S", "accent", bold=True), StyledSegment(" Later    ", "text"),
+            StyledSegment("Q", "accent", bold=True), StyledSegment(" Close", "text"),
+        ]
+    lines.append(_box_row(primary_actions, width, palette, color_enabled=color_enabled))
+    if secondary_actions:
+        lines.append(_box_row(secondary_actions, width, palette, color_enabled=color_enabled))
+    lines.append(_box_border(width, palette, color_enabled=color_enabled, bottom=True))
+    return lines
+
+
+def render_force_delete_dialog(
+    inspection: BranchInspection,
+    palette: ThemePalette,
+    *,
+    columns: int,
+    decorated: bool,
+    color_enabled: bool,
+) -> List[str]:
+    if not decorated or columns < 48:
+        return [
+            "Force deletion can discard commits not merged into the default branch.",
+            f"Type '{inspection.branch}' to force-delete.",
+        ]
+    width = max(48, min(columns - 2, 76))
+    return [
+        _box_border(width, palette, color_enabled=color_enabled, title="Force delete"),
+        _box_row([], width, palette, color_enabled=color_enabled),
+        _box_row(
+            [StyledSegment("! Destructive action", "danger", bold=True)],
+            width,
+            palette,
+            color_enabled=color_enabled,
+        ),
+        _box_row(
+            [StyledSegment("Commits not merged into the default branch can be lost.", "warning")],
+            width,
+            palette,
+            color_enabled=color_enabled,
+        ),
+        _box_row([], width, palette, color_enabled=color_enabled),
+        _box_row(
+            [StyledSegment("Type the exact branch name to continue:", "muted")],
+            width,
+            palette,
+            color_enabled=color_enabled,
+        ),
+        _box_row(
+            [StyledSegment(inspection.branch, "branch", bold=True)],
+            width,
+            palette,
+            color_enabled=color_enabled,
+        ),
+        _box_row([], width, palette, color_enabled=color_enabled),
+        _box_border(width, palette, color_enabled=color_enabled, bottom=True),
+    ]
+
+
 def review_pending_cleanups(
     state_dir: Path,
     *,
     cleanup_id: Optional[str] = None,
     input_fn: Callable[[str], str] = input,
     output_fn: Callable[[str], None] = print,
+    env: Optional[Mapping[str, str]] = None,
 ) -> int:
+    effective_env = os.environ if env is None else env
+    decorated = output_fn is print and sys.stdout.isatty()
+    color_enabled = (
+        decorated
+        and "NO_COLOR" not in effective_env
+        and effective_env.get("TERM", "") != "dumb"
+    )
+    theme_settings = load_theme_settings(effective_env)
+    appearance = query_terminal_appearance() if decorated and theme_settings.auto_switch else None
+    palette = resolve_theme_palette(theme_settings, appearance=appearance)
+    columns = shutil.get_terminal_size((80, 24)).columns
     records = list_pending_cleanups(state_dir)
     if cleanup_id:
         records = [record for record in records if record.get("id") == cleanup_id]
@@ -1015,42 +1800,34 @@ def review_pending_cleanups(
             continue
 
         _clear_screen()
-        output_fn("Herdr branch cleanup review")
-        output_fn("")
-        output_fn(f"Repository: {_safe_terminal_text(inspection.repo_root)}")
-        output_fn(
-            f"Removed worktree: "
-            f"{_safe_terminal_text(record.get('worktree_path', 'unknown'))}"
-        )
-        output_fn(f"Branch: {_safe_terminal_text(inspection.branch)}")
-        output_fn(f"Last commit: {_safe_terminal_text(inspection.last_commit or 'unknown')}")
-        output_fn(
-            f"Default branch ref: {_safe_terminal_text(inspection.default_ref or 'unknown')}"
-        )
-        output_fn(f"Merged into default: {_yes_no_unknown(inspection.merged_into_default)}")
-        output_fn(f"Upstream: {_safe_terminal_text(inspection.upstream or 'none')}")
-        if inspection.ahead is not None and inspection.behind is not None:
-            output_fn(f"Upstream distance: ahead {inspection.ahead}, behind {inspection.behind}")
-        output_fn("Remote branches are never deleted by this plugin.")
-        if record.get("forced_worktree_removal"):
-            output_fn("Warning: the worktree itself was removed with --force.")
+        for line in render_cleanup_dialog(
+            inspection,
+            record,
+            palette,
+            columns=columns,
+            decorated=decorated,
+            color_enabled=color_enabled,
+        ):
+            output_fn(line)
 
         if not inspection.exists:
             output_fn("The local branch no longer exists; marking this request resolved.")
             _resolve_pending_cleanup(state_dir, record, "already_absent")
             continue
-        if inspection.protected:
-            output_fn("Deletion blocked: this is a protected/default branch.")
-        if inspection.used_by_worktrees:
-            output_fn("Deletion blocked: branch is used by another worktree:")
-            for path in inspection.used_by_worktrees:
-                output_fn(f"  {_safe_terminal_text(path)}")
 
         while True:
             if inspection.protected or inspection.used_by_worktrees:
                 prompt = "[K]eep branch (default)  [S]kip for later  [Q]uit: "
             else:
                 prompt = "[K]eep (default)  [D]elete safely  [F]orce delete...  [S]kip  [Q]uit: "
+            if decorated:
+                prompt = _style_text(
+                    "Select › ",
+                    palette,
+                    "accent",
+                    enabled=color_enabled,
+                    bold=True,
+                )
             try:
                 choice = input_fn(prompt).strip().lower()
             except EOFError:
@@ -1083,9 +1860,26 @@ def review_pending_cleanups(
                 output_fn(f"Deleted local branch {inspection.branch} safely.")
                 break
             if choice in ("f", "force") and not inspection.protected and not inspection.used_by_worktrees:
-                output_fn("Force deletion can discard commits not merged into the default branch.")
+                _clear_screen()
+                for line in render_force_delete_dialog(
+                    inspection,
+                    palette,
+                    columns=columns,
+                    decorated=decorated,
+                    color_enabled=color_enabled,
+                ):
+                    output_fn(line)
+                confirmation_prompt = f"Type '{inspection.branch}' to force-delete: "
+                if decorated:
+                    confirmation_prompt = _style_text(
+                        "Branch name › ",
+                        palette,
+                        "danger",
+                        enabled=color_enabled,
+                        bold=True,
+                    )
                 try:
-                    confirmation = input_fn(f"Type '{inspection.branch}' to force-delete: ").strip()
+                    confirmation = input_fn(confirmation_prompt).strip()
                 except EOFError:
                     output_fn("No confirmation; request remains pending.")
                     return 0
@@ -1579,7 +2373,7 @@ def main(argv: Optional[Sequence[str]] = None, env: Optional[Mapping[str, str]] 
             return 0
         if args.action == "branch-cleanup":
             cleanup_id = effective_env.get("HERDR_BRANCH_CLEANUP_ID")
-            return review_pending_cleanups(state_dir, cleanup_id=cleanup_id)
+            return review_pending_cleanups(state_dir, cleanup_id=cleanup_id, env=effective_env)
         target_path = resolve_target_path(args.target, effective_env)
         context = resolve_repository(target_path)
         if args.action == "status":

@@ -18,7 +18,7 @@ The plugin supports Herdr 0.7.0 or newer on Linux and macOS. It requires Python 
 Install the tagged release from GitHub:
 
 ```sh
-herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.2.0
+herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.2.1
 ```
 
 For local development, link this checkout:
@@ -142,6 +142,12 @@ herdr plugin action invoke zerodice0.worktree-bootstrap.review-branch-cleanup
 The plugin caches worktree-to-primary-checkout provenance when `worktree.created` fires so removal events with a missing workspace snapshot can still be reviewed safely. Detached worktrees have no local branch cleanup and are ignored.
 If neither the removal event nor that cache can identify and validate the primary checkout, the event is logged and no cleanup request or branch deletion is attempted.
 
+### Theme-aware cleanup dialog
+
+In an interactive Herdr popup, the cleanup review follows Herdr's configured built-in theme and supported semantic overrides from `[theme.custom]`. It re-reads the theme when each popup opens, keeps the terminal background transparent, and uses Herdr's light/dark sibling selection when `theme.auto_switch` is enabled. The current built-in themes and aliases from Herdr 0.7.5 are supported.
+
+The plugin reads only `name`, `auto_switch`, `dark_name`, and `light_name` from `[theme]`, supported color strings from `[theme.custom]`, and the legacy `ui.accent` fallback. It never logs configuration contents. Unknown themes, unsupported TOML forms, unavailable terminal appearance responses, `NO_COLOR`, non-interactive output, and narrow terminals fall back safely without affecting branch inspection or deletion rules.
+
 ## Copy and failure guarantees
 
 Before replacing a configured path, the plugin stages every eligible source. Existing target entries are then renamed to transaction backups and staged entries are renamed into place. If any commit step fails, already replaced entries are restored in reverse order. Because directories are replaced as whole entries, target-only stale files disappear after a successful sync.
@@ -169,7 +175,7 @@ Before validation, find and disable the old plugin:
 ```sh
 herdr plugin list
 herdr plugin disable OLD_PLUGIN_ID
-herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.2.0
+herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.2.1
 ```
 
 To roll back, disable this plugin and re-enable the previous one. Control files are left untouched:

@@ -5,12 +5,14 @@ import io
 import json
 import os
 from pathlib import Path
+import pty
 import re
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -202,6 +204,8 @@ accent = "cyan"
         self.assertIn("\033[38;2;122;162;247m", rendered)
         self.assertIn("MERGED", rendered)
         self.assertIn("Remote branches are never changed", rendered)
+        self.assertNotIn("╭", rendered)
+        self.assertNotIn("│", rendered)
         ansi = re.compile(r"\x1b\[[0-9;]*m")
         for line in lines:
             visible = ansi.sub("", line)
@@ -222,7 +226,7 @@ accent = "cyan"
         self.assertNotIn("\x1b", rendered)
         self.assertNotIn("╭", rendered)
 
-    def test_force_delete_dialog_has_separate_destructive_confirmation_card(self):
+    def test_force_delete_dialog_is_flat_inside_herdr_popup(self):
         palette = plugin.resolve_theme_palette(plugin.ThemeSettings(name="dracula"))
         lines = plugin.render_force_delete_dialog(
             self.inspection(merged_into_default=False),
@@ -234,7 +238,41 @@ accent = "cyan"
         rendered = "\n".join(lines)
         self.assertIn("Destructive action", rendered)
         self.assertIn("feature/theme-dialog", rendered)
-        self.assertIn("╭─ Force delete", rendered)
+        self.assertNotIn("╭", rendered)
+        self.assertNotIn("│", rendered)
+
+    def test_single_key_reader_does_not_echo_and_restores_terminal(self):
+        master, slave = pty.openpty()
+        output = io.StringIO()
+        original = plugin.termios.tcgetattr(slave)
+        writer = threading.Timer(0.05, os.write, args=(master, b"D"))
+        writer.start()
+        try:
+            self.assertEqual(
+                plugin.normalize_cleanup_choice(
+                    plugin.read_single_key(input_fd=slave, output_stream=output)
+                ),
+                "d",
+            )
+            restored = plugin.termios.tcgetattr(slave)
+        finally:
+            writer.join()
+            os.close(master)
+            os.close(slave)
+        restored_mode = restored[3] & (plugin.termios.ICANON | plugin.termios.ECHO)
+        original_mode = original[3] & (plugin.termios.ICANON | plugin.termios.ECHO)
+        self.assertEqual(restored_mode, original_mode)
+        self.assertEqual(restored[6][plugin.termios.VMIN], original[6][plugin.termios.VMIN])
+        self.assertEqual(restored[6][plugin.termios.VTIME], original[6][plugin.termios.VTIME])
+        self.assertEqual(output.getvalue(), "\033[?25l\033[?25h")
+
+    def test_cleanup_choice_supports_enter_escape_and_korean_layout_keys(self):
+        self.assertEqual(plugin.normalize_cleanup_choice(""), "")
+        self.assertEqual(plugin.normalize_cleanup_choice("ㅇ"), "d")
+        self.assertEqual(plugin.normalize_cleanup_choice("ㄹ"), "f")
+        self.assertEqual(plugin.normalize_cleanup_choice("ㄴ"), "s")
+        self.assertEqual(plugin.normalize_cleanup_choice("ㅂ"), "q")
+        self.assertEqual(plugin.normalize_cleanup_choice("ㅏ"), "k")
 
 
 class GitRepositoryTestCase(unittest.TestCase):
@@ -751,6 +789,8 @@ class BranchCleanupTests(GitRepositoryTestCase):
         command = run_mock.call_args.args[0]
         self.assertIn("HERDR_BRANCH_CLEANUP_ID=" + "a" * 24, command)
         self.assertNotIn("feature", command)
+        self.assertEqual(command[command.index("--width") + 1], "68%")
+        self.assertEqual(command[command.index("--height") + 1], "50%")
 
     def test_event_keeps_pending_when_popup_cannot_open(self):
         self.record_and_remove_target()

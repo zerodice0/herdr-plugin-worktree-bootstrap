@@ -1505,16 +1505,15 @@ def _fit_segments(segments: Sequence[StyledSegment], maximum: int) -> List[Style
     return fitted
 
 
-def _box_row(
+def _flat_line(
     segments: Sequence[StyledSegment],
     width: int,
     palette: ThemePalette,
     *,
     color_enabled: bool,
+    indent: int = 2,
 ) -> str:
-    inner_width = width - 4
-    fitted = _fit_segments(segments, inner_width)
-    visible_width = sum(_display_width(segment.text) for segment in fitted)
+    fitted = _fit_segments(segments, max(0, width - indent))
     content = "".join(
         _style_text(
             segment.text,
@@ -1526,26 +1525,17 @@ def _box_row(
         )
         for segment in fitted
     )
-    border = _style_text("│", palette, "accent", enabled=color_enabled)
-    return f"{border} {content}{' ' * max(0, inner_width - visible_width)} {border}"
+    return " " * indent + content
 
 
-def _box_border(
+def _flat_separator(
     width: int,
     palette: ThemePalette,
     *,
     color_enabled: bool,
-    title: Optional[str] = None,
-    bottom: bool = False,
 ) -> str:
-    if bottom:
-        value = "╰" + "─" * (width - 2) + "╯"
-    elif title:
-        prefix = f"╭─ {title} "
-        value = prefix + "─" * max(0, width - _display_width(prefix) - 1) + "╮"
-    else:
-        value = "├" + "─" * (width - 2) + "┤"
-    return _style_text(value, palette, "accent", enabled=color_enabled, bold=bool(title))
+    value = "  " + "─" * max(1, width - 4)
+    return _style_text(value, palette, "subtle", enabled=color_enabled, dim=True)
 
 
 def _friendly_path(value: Any) -> str:
@@ -1610,23 +1600,22 @@ def render_cleanup_dialog(
     if not decorated or columns < 48:
         return _plain_cleanup_dialog(inspection, record)
 
-    width = max(48, min(columns - 2, 88))
+    width = max(48, min(columns, 88))
     status, status_role = _cleanup_status(inspection)
     lines = [
-        _box_border(width, palette, color_enabled=color_enabled, title="Branch cleanup"),
-        _box_row([], width, palette, color_enabled=color_enabled),
-        _box_row(
+        "",
+        _flat_line(
             [StyledSegment("✓ ", "positive", bold=True), StyledSegment("Worktree removed", "text", bold=True)],
             width,
             palette,
             color_enabled=color_enabled,
         ),
-        _box_row([], width, palette, color_enabled=color_enabled),
+        "",
     ]
 
     def detail(label: str, value: str, role: str = "text", bold: bool = False) -> None:
         lines.append(
-            _box_row(
+            _flat_line(
                 [StyledSegment(f"{label:<13}", "muted"), StyledSegment(value, role, bold=bold)],
                 width,
                 palette,
@@ -1645,10 +1634,10 @@ def render_cleanup_dialog(
             upstream += f" · ahead {inspection.ahead}, behind {inspection.behind}"
         detail("Upstream", upstream)
 
-    lines.append(_box_row([], width, palette, color_enabled=color_enabled))
+    lines.append("")
     if record.get("forced_worktree_removal"):
         lines.append(
-            _box_row(
+            _flat_line(
                 [StyledSegment("! Worktree removal was forced.", "peach", bold=True)],
                 width,
                 palette,
@@ -1665,9 +1654,9 @@ def render_cleanup_dialog(
         advice = StyledSegment("Unmerged commits may be lost by force deletion.", "warning", bold=True)
     else:
         advice = StyledSegment("Review this branch before choosing deletion.", "warning", bold=True)
-    lines.append(_box_row([advice], width, palette, color_enabled=color_enabled))
+    lines.append(_flat_line([advice], width, palette, color_enabled=color_enabled))
     lines.append(
-        _box_row(
+        _flat_line(
             [StyledSegment("Remote branches are never changed.", "subtle", dim=True)],
             width,
             palette,
@@ -1676,7 +1665,7 @@ def render_cleanup_dialog(
     )
     for path in inspection.used_by_worktrees:
         lines.append(
-            _box_row(
+            _flat_line(
                 [StyledSegment("↳ ", "warning"), StyledSegment(_friendly_path(path), "muted")],
                 width,
                 palette,
@@ -1684,7 +1673,7 @@ def render_cleanup_dialog(
             )
         )
 
-    lines.append(_box_border(width, palette, color_enabled=color_enabled))
+    lines.extend(["", _flat_separator(width, palette, color_enabled=color_enabled)])
     blocked = inspection.protected or bool(inspection.used_by_worktrees)
     if blocked:
         primary_actions = [
@@ -1703,10 +1692,10 @@ def render_cleanup_dialog(
             StyledSegment("S", "accent", bold=True), StyledSegment(" Later    ", "text"),
             StyledSegment("Q", "accent", bold=True), StyledSegment(" Close", "text"),
         ]
-    lines.append(_box_row(primary_actions, width, palette, color_enabled=color_enabled))
+    lines.append(_flat_line(primary_actions, width, palette, color_enabled=color_enabled))
     if secondary_actions:
-        lines.append(_box_row(secondary_actions, width, palette, color_enabled=color_enabled))
-    lines.append(_box_border(width, palette, color_enabled=color_enabled, bottom=True))
+        lines.append(_flat_line(secondary_actions, width, palette, color_enabled=color_enabled))
+    lines.append("")
     return lines
 
 
@@ -1723,38 +1712,103 @@ def render_force_delete_dialog(
             "Force deletion can discard commits not merged into the default branch.",
             f"Type '{inspection.branch}' to force-delete.",
         ]
-    width = max(48, min(columns - 2, 76))
+    width = max(48, min(columns, 76))
     return [
-        _box_border(width, palette, color_enabled=color_enabled, title="Force delete"),
-        _box_row([], width, palette, color_enabled=color_enabled),
-        _box_row(
+        "",
+        _flat_line(
             [StyledSegment("! Destructive action", "danger", bold=True)],
             width,
             palette,
             color_enabled=color_enabled,
         ),
-        _box_row(
+        _flat_line(
             [StyledSegment("Commits not merged into the default branch can be lost.", "warning")],
             width,
             palette,
             color_enabled=color_enabled,
         ),
-        _box_row([], width, palette, color_enabled=color_enabled),
-        _box_row(
+        "",
+        _flat_line(
             [StyledSegment("Type the exact branch name to continue:", "muted")],
             width,
             palette,
             color_enabled=color_enabled,
         ),
-        _box_row(
+        _flat_line(
             [StyledSegment(inspection.branch, "branch", bold=True)],
             width,
             palette,
             color_enabled=color_enabled,
         ),
-        _box_row([], width, palette, color_enabled=color_enabled),
-        _box_border(width, palette, color_enabled=color_enabled, bottom=True),
+        "",
     ]
+
+
+def _read_utf8_character(file_descriptor: int) -> str:
+    first = os.read(file_descriptor, 1)
+    if not first:
+        raise EOFError
+    leading = first[0]
+    if leading < 0x80:
+        length = 1
+    elif leading & 0xE0 == 0xC0:
+        length = 2
+    elif leading & 0xF0 == 0xE0:
+        length = 3
+    elif leading & 0xF8 == 0xF0:
+        length = 4
+    else:
+        length = 1
+    data = first
+    while len(data) < length:
+        continuation = os.read(file_descriptor, length - len(data))
+        if not continuation:
+            break
+        data += continuation
+    return data.decode("utf-8", errors="replace")
+
+
+def read_single_key(
+    *,
+    input_fd: Optional[int] = None,
+    output_stream: Optional[Any] = None,
+) -> str:
+    """Read one key without echo, restoring terminal state on every exit path."""
+
+    file_descriptor = sys.stdin.fileno() if input_fd is None else input_fd
+    stream = sys.stdout if output_stream is None else output_stream
+    old_attributes = termios.tcgetattr(file_descriptor)
+    new_attributes = list(old_attributes)
+    new_attributes[6] = list(old_attributes[6])
+    new_attributes[3] &= ~(termios.ICANON | termios.ECHO)
+    new_attributes[6][termios.VMIN] = 1
+    new_attributes[6][termios.VTIME] = 0
+    stream.write("\033[?25l")
+    stream.flush()
+    try:
+        termios.tcsetattr(file_descriptor, termios.TCSADRAIN, new_attributes)
+        character = _read_utf8_character(file_descriptor)
+        if character == "\x03":
+            raise KeyboardInterrupt
+        if character == "\x1b":
+            while select.select([file_descriptor], [], [], 0.01)[0]:
+                os.read(file_descriptor, 1)
+            return "q"
+        if character in ("\r", "\n"):
+            return ""
+        return character
+    finally:
+        try:
+            termios.tcsetattr(file_descriptor, termios.TCSADRAIN, old_attributes)
+        finally:
+            stream.write("\033[?25h")
+            stream.flush()
+
+
+def normalize_cleanup_choice(value: str) -> str:
+    choice = value.strip().casefold()
+    # These jamo are produced by the same physical keys with a Korean layout.
+    return {"ㅇ": "d", "ㄹ": "f", "ㄴ": "s", "ㅂ": "q", "ㅏ": "k"}.get(choice, choice)
 
 
 def review_pending_cleanups(
@@ -1799,28 +1853,34 @@ def review_pending_cleanups(
             output_fn("The request remains pending for later review.")
             continue
 
-        _clear_screen()
-        for line in render_cleanup_dialog(
-            inspection,
-            record,
-            palette,
-            columns=columns,
-            decorated=decorated,
-            color_enabled=color_enabled,
-        ):
-            output_fn(line)
+        def display_cleanup(*notices: str) -> None:
+            _clear_screen()
+            for line in render_cleanup_dialog(
+                inspection,
+                record,
+                palette,
+                columns=columns,
+                decorated=decorated,
+                color_enabled=color_enabled,
+            ):
+                output_fn(line)
+            for notice in notices:
+                output_fn(notice)
+
+        display_cleanup()
 
         if not inspection.exists:
             output_fn("The local branch no longer exists; marking this request resolved.")
             _resolve_pending_cleanup(state_dir, record, "already_absent")
             continue
 
+        single_key_mode = decorated and input_fn is input and sys.stdin.isatty()
         while True:
             if inspection.protected or inspection.used_by_worktrees:
                 prompt = "[K]eep branch (default)  [S]kip for later  [Q]uit: "
             else:
                 prompt = "[K]eep (default)  [D]elete safely  [F]orce delete...  [S]kip  [Q]uit: "
-            if decorated:
+            if decorated and not single_key_mode:
                 prompt = _style_text(
                     "Select › ",
                     palette,
@@ -1829,7 +1889,14 @@ def review_pending_cleanups(
                     bold=True,
                 )
             try:
-                choice = input_fn(prompt).strip().lower()
+                if single_key_mode:
+                    try:
+                        choice = normalize_cleanup_choice(read_single_key())
+                    except (OSError, ValueError, AttributeError):
+                        single_key_mode = False
+                        choice = normalize_cleanup_choice(input_fn(prompt))
+                else:
+                    choice = normalize_cleanup_choice(input_fn(prompt))
             except EOFError:
                 output_fn("No interactive input; request remains pending.")
                 return 0
@@ -1852,9 +1919,11 @@ def review_pending_cleanups(
                     )
                 except BootstrapError as exc:
                     _record_cleanup_result(state_dir, record, "safe_delete_failed", error=str(exc))
-                    output_fn(f"Safe deletion refused: {_safe_terminal_text(exc)}")
-                    output_fn("The request remains pending. Use force only after reviewing unmerged commits.")
                     inspection = inspect_branch(inspection.repo_root, inspection.branch)
+                    display_cleanup(
+                        f"Safe deletion refused: {_safe_terminal_text(exc)}",
+                        "The request remains pending. Use force only after reviewing unmerged commits.",
+                    )
                     continue
                 _resolve_pending_cleanup(state_dir, record, "deleted_safely")
                 output_fn(f"Deleted local branch {inspection.branch} safely.")
@@ -1884,7 +1953,7 @@ def review_pending_cleanups(
                     output_fn("No confirmation; request remains pending.")
                     return 0
                 if confirmation != inspection.branch:
-                    output_fn("Branch name did not match; nothing was deleted.")
+                    display_cleanup("Branch name did not match; nothing was deleted.")
                     continue
                 try:
                     delete_local_branch(
@@ -1895,13 +1964,17 @@ def review_pending_cleanups(
                     )
                 except BootstrapError as exc:
                     _record_cleanup_result(state_dir, record, "force_delete_failed", error=str(exc))
-                    output_fn(f"Force deletion failed: {_safe_terminal_text(exc)}")
                     inspection = inspect_branch(inspection.repo_root, inspection.branch)
+                    display_cleanup(f"Force deletion failed: {_safe_terminal_text(exc)}")
                     continue
                 _resolve_pending_cleanup(state_dir, record, "deleted_forcibly")
                 output_fn(f"Force-deleted local branch {inspection.branch}.")
                 break
-            output_fn("Unknown or unavailable choice.")
+            if single_key_mode:
+                sys.stdout.write("\a")
+                sys.stdout.flush()
+            else:
+                output_fn("Unknown or unavailable choice.")
     return 0
 
 
@@ -1932,9 +2005,9 @@ def launch_branch_cleanup_popup(
         "--placement",
         "popup",
         "--width",
-        "72%",
+        "68%",
         "--height",
-        "72%",
+        "50%",
         "--focus",
         "--env",
         f"HERDR_BRANCH_CLEANUP_ID={cleanup_id}",

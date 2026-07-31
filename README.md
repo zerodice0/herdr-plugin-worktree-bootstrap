@@ -18,7 +18,7 @@ The plugin supports Herdr 0.7.0 or newer on Linux and macOS. It requires Python 
 Install the tagged release from GitHub:
 
 ```sh
-herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.2.1
+herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.2.2
 ```
 
 For local development, link this checkout:
@@ -131,6 +131,8 @@ The choices are:
 - **Force delete**: display an unmerged-commit warning and require typing the exact branch name before running `git branch -D`.
 - **Skip**: keep the request pending for later review.
 
+In the interactive popup, press `D`, `F`, `S`, or `Q` to act immediately; no Enter is required. Press Enter by itself to keep the branch. The exact branch-name confirmation for force deletion intentionally remains a typed value followed by Enter. If direct key reading is unavailable, the popup falls back to the same choices through normal line input.
+
 `main`, `master`, `develop`, `development`, `trunk`, the detected default branch, and any branch checked out in another worktree cannot be deleted from the popup. Branch state is inspected again immediately before deletion to close the race between display and confirmation. Remote branches are displayed through upstream status but are never deleted.
 
 The hook runs after Herdr has removed the worktree. Herdr v1 does not expose a pre-remove interception or native yes/no dialog API, so this plugin cannot modify the built-in removal confirmation. If no foreground client exists or another popup is busy, the handler never deletes anything; the resolved request remains under `HERDR_PLUGIN_STATE_DIR` and can be reopened with:
@@ -144,7 +146,7 @@ If neither the removal event nor that cache can identify and validate the primar
 
 ### Theme-aware cleanup dialog
 
-In an interactive Herdr popup, the cleanup review follows Herdr's configured built-in theme and supported semantic overrides from `[theme.custom]`. It re-reads the theme when each popup opens, keeps the terminal background transparent, and uses Herdr's light/dark sibling selection when `theme.auto_switch` is enabled. The current built-in themes and aliases from Herdr 0.7.5 are supported.
+In an interactive Herdr popup, the cleanup review follows Herdr's configured built-in theme and supported semantic overrides from `[theme.custom]`. It uses Herdr's popup frame as the only border, re-reads the theme when each popup opens, keeps the terminal background transparent, and uses Herdr's light/dark sibling selection when `theme.auto_switch` is enabled. The current built-in themes and aliases from Herdr 0.7.5 are supported.
 
 The plugin reads only `name`, `auto_switch`, `dark_name`, and `light_name` from `[theme]`, supported color strings from `[theme.custom]`, and the legacy `ui.accent` fallback. It never logs configuration contents. Unknown themes, unsupported TOML forms, unavailable terminal appearance responses, `NO_COLOR`, non-interactive output, and narrow terminals fall back safely without affecting branch inspection or deletion rules.
 
@@ -175,7 +177,7 @@ Before validation, find and disable the old plugin:
 ```sh
 herdr plugin list
 herdr plugin disable OLD_PLUGIN_ID
-herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.2.1
+herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.2.2
 ```
 
 To roll back, disable this plugin and re-enable the previous one. Control files are left untouched:

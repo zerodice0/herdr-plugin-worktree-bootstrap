@@ -68,6 +68,51 @@ def main() -> int:
             raise RuntimeError("event-context smoke invocation failed")
         if (event_target / ".local-value").read_text(encoding="utf-8") != "from event":
             raise RuntimeError("event-context target was not bootstrapped")
+        run("git", "worktree", "remove", os.fspath(event_target), cwd=source)
+        removed_env = {
+            "HERDR_PLUGIN_EVENT": "worktree.removed",
+            "HERDR_PLUGIN_EVENT_JSON": json.dumps(
+                {
+                    "event": "worktree.removed",
+                    "data": {
+                        "type": "worktree_removed",
+                        "workspace_id": "smoke-workspace",
+                        "workspace": {
+                            "workspace_id": "smoke-workspace",
+                            "worktree": {
+                                "repo_root": os.fspath(source),
+                                "repo_key": os.fspath(source / ".git"),
+                                "repo_name": source.name,
+                                "checkout_path": os.fspath(event_target),
+                                "is_linked_worktree": True,
+                            },
+                        },
+                        "worktree": {
+                            "path": os.fspath(event_target),
+                            "branch": "event-smoke",
+                            "is_bare": False,
+                            "is_detached": False,
+                            "is_prunable": False,
+                            "is_linked_worktree": True,
+                            "label": "event-smoke",
+                        },
+                        "forced": False,
+                    },
+                }
+            ),
+        }
+        plugin.handle_branch_cleanup_event(removed_env, state, open_popup=False)
+        plugin.review_pending_cleanups(
+            state,
+            input_fn=lambda prompt: "d",
+            output_fn=lambda line: None,
+        )
+        branch_check = subprocess.run(
+            ["git", "-C", os.fspath(source), "show-ref", "--verify", "--quiet", "refs/heads/event-smoke"],
+            check=False,
+        )
+        if branch_check.returncode == 0:
+            raise RuntimeError("removed worktree branch was not safely deleted")
     print("Herdr action/event environment smoke test passed")
     return 0
 

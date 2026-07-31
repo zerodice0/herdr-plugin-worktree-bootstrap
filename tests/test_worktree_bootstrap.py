@@ -5,11 +5,14 @@ import io
 import json
 import os
 from pathlib import Path
+import pty
+import re
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -101,6 +104,227 @@ class ContextResolverTests(unittest.TestCase):
             plugin.resolve_target_path(None, {"HERDR_PLUGIN_CONTEXT_JSON": "{"})
 
 
+class ThemeRenderingTests(unittest.TestCase):
+    def inspection(self, **overrides):
+        values = {
+            "repo_root": Path("/tmp/프로젝트"),
+            "branch": "feature/theme-dialog",
+            "exists": True,
+            "protected": False,
+            "protection_reason": None,
+            "used_by_worktrees": (),
+            "default_ref": "main",
+            "merged_into_default": True,
+            "upstream": "origin/feature/theme-dialog",
+            "ahead": 0,
+            "behind": 0,
+            "last_commit": "abc1234 Polish cleanup dialog",
+            "head_oid": "a" * 40,
+        }
+        values.update(overrides)
+        return plugin.BranchInspection(**values)
+
+    def test_loads_herdr_theme_and_custom_overrides_without_full_toml_dependency(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "config.toml"
+            config.write_text(
+                """
+[theme]
+name = "tokyo-night" # active theme
+auto_switch = true
+dark_name = 'dracula'
+light_name = "tokyo-night-day"
+
+[theme.custom]
+accent = "#abcdef"
+red = "rgb(200, 10, 20)"
+
+[ui]
+accent = "cyan"
+""",
+                encoding="utf-8",
+            )
+            settings = plugin.load_theme_settings({}, config_path=config)
+        self.assertEqual(settings.name, "tokyo-night")
+        self.assertTrue(settings.auto_switch)
+        self.assertEqual(settings.dark_name, "dracula")
+        self.assertEqual(settings.light_name, "tokyo-night-day")
+        self.assertEqual(settings.custom["accent"], "#abcdef")
+        self.assertEqual(settings.custom["red"], "rgb(200, 10, 20)")
+        self.assertEqual(settings.legacy_accent, "cyan")
+
+    def test_missing_or_unreadable_theme_config_uses_catppuccin(self):
+        settings = plugin.load_theme_settings({}, config_path=Path("/does/not/exist"))
+        palette = plugin.resolve_theme_palette(settings)
+        self.assertEqual(palette.name, "catppuccin")
+        self.assertEqual(palette.accent, (137, 180, 250))
+
+    def test_auto_switch_uses_same_light_dark_sibling_names_as_herdr(self):
+        settings = plugin.ThemeSettings(name="tokyo-night", auto_switch=True)
+        self.assertEqual(
+            plugin.resolve_theme_palette(settings, appearance="dark").name,
+            "tokyo-night",
+        )
+        light = plugin.resolve_theme_palette(settings, appearance="light")
+        self.assertEqual(light.name, "tokyo-night-day")
+        self.assertEqual(light.accent, (46, 125, 233))
+
+    def test_custom_colors_override_semantic_palette_and_ignore_invalid_values(self):
+        settings = plugin.ThemeSettings(
+            name="nord",
+            custom={"accent": "#abc", "red": "rgb(1, 2, 3)", "green": "invalid"},
+        )
+        palette = plugin.resolve_theme_palette(settings)
+        self.assertEqual(palette.accent, (170, 187, 204))
+        self.assertEqual(palette.danger, (1, 2, 3))
+        self.assertEqual(palette.positive, (163, 190, 140))
+
+    def test_terminal_background_response_drives_auto_switch_appearance(self):
+        self.assertEqual(
+            plugin._appearance_from_terminal_response("\x1b]11;rgb:1111/2222/3333\x1b\\"),
+            "dark",
+        )
+        self.assertEqual(
+            plugin._appearance_from_terminal_response("\x1b]11;#f0f0f0\x07"),
+            "light",
+        )
+        self.assertIsNone(plugin._appearance_from_terminal_response("not an OSC response"))
+
+    def test_themed_dialog_uses_tokyo_night_colors_and_respects_display_width(self):
+        palette = plugin.resolve_theme_palette(plugin.ThemeSettings(name="tokyo-night"))
+        lines = plugin.render_cleanup_dialog(
+            self.inspection(),
+            {"worktree_path": "/tmp/프로젝트 worktree", "forced_worktree_removal": False},
+            palette,
+            columns=72,
+            decorated=True,
+            color_enabled=True,
+        )
+        rendered = "\n".join(lines)
+        self.assertIn("\033[38;2;122;162;247m", rendered)
+        self.assertIn("MERGED", rendered)
+        self.assertIn("Remote branches are never changed", rendered)
+        self.assertNotIn("╭", rendered)
+        self.assertNotIn("│", rendered)
+        ansi = re.compile(r"\x1b\[[0-9;]*m")
+        visible_rendered = ansi.sub("", rendered)
+        self.assertIn(
+            "ENTER Keep    D Delete safely    F Force…    S Later    Q Close",
+            visible_rendered,
+        )
+        for line in lines:
+            visible = ansi.sub("", line)
+            self.assertLessEqual(plugin._display_width(visible), 72)
+
+    def test_action_footer_uses_one_line_when_it_fits_and_balanced_rows_when_needed(self):
+        palette = plugin.resolve_theme_palette(plugin.ThemeSettings(name="tokyo-night"))
+        record = {"worktree_path": "/tmp/worktree", "forced_worktree_removal": False}
+
+        def action_lines(columns):
+            lines = plugin.render_cleanup_dialog(
+                self.inspection(),
+                record,
+                palette,
+                columns=columns,
+                decorated=True,
+                color_enabled=False,
+            )
+            return [
+                line.strip()
+                for line in lines
+                if "ENTER Keep" in line or "F Force…" in line
+            ]
+
+        self.assertEqual(
+            action_lines(65),
+            ["ENTER Keep    D Delete safely    F Force…    S Later    Q Close"],
+        )
+        expected_compact = [
+            "ENTER Keep    D Delete safely",
+            "F Force…    S Later    Q Close",
+        ]
+        self.assertEqual(action_lines(64), expected_compact)
+        self.assertEqual(action_lines(32), expected_compact)
+
+    def test_very_narrow_tty_uses_visible_line_input_fallback(self):
+        palette = plugin.resolve_theme_palette(plugin.ThemeSettings(name="tokyo-night"))
+        lines = plugin.render_cleanup_dialog(
+            self.inspection(),
+            {"worktree_path": "/tmp/worktree", "forced_worktree_removal": False},
+            palette,
+            columns=31,
+            decorated=True,
+            color_enabled=False,
+        )
+        self.assertFalse(plugin._supports_action_footer(True, 31))
+        self.assertTrue(plugin._supports_action_footer(True, 32))
+        self.assertNotIn("ENTER Keep", "\n".join(lines))
+        self.assertIn("Herdr branch cleanup review", lines)
+
+    def test_non_tty_dialog_remains_plain_and_log_friendly(self):
+        palette = plugin.resolve_theme_palette(plugin.ThemeSettings(name="tokyo-night"))
+        lines = plugin.render_cleanup_dialog(
+            self.inspection(protected=True),
+            {"worktree_path": "/tmp/worktree", "forced_worktree_removal": False},
+            palette,
+            columns=80,
+            decorated=False,
+            color_enabled=False,
+        )
+        rendered = "\n".join(lines)
+        self.assertIn("Deletion blocked", rendered)
+        self.assertNotIn("\x1b", rendered)
+        self.assertNotIn("╭", rendered)
+
+    def test_force_delete_dialog_is_flat_inside_herdr_popup(self):
+        palette = plugin.resolve_theme_palette(plugin.ThemeSettings(name="dracula"))
+        lines = plugin.render_force_delete_dialog(
+            self.inspection(merged_into_default=False),
+            palette,
+            columns=70,
+            decorated=True,
+            color_enabled=False,
+        )
+        rendered = "\n".join(lines)
+        self.assertIn("Destructive action", rendered)
+        self.assertIn("feature/theme-dialog", rendered)
+        self.assertNotIn("╭", rendered)
+        self.assertNotIn("│", rendered)
+
+    def test_single_key_reader_does_not_echo_and_restores_terminal(self):
+        master, slave = pty.openpty()
+        output = io.StringIO()
+        original = plugin.termios.tcgetattr(slave)
+        writer = threading.Timer(0.05, os.write, args=(master, b"D"))
+        writer.start()
+        try:
+            self.assertEqual(
+                plugin.normalize_cleanup_choice(
+                    plugin.read_single_key(input_fd=slave, output_stream=output)
+                ),
+                "d",
+            )
+            restored = plugin.termios.tcgetattr(slave)
+        finally:
+            writer.join()
+            os.close(master)
+            os.close(slave)
+        restored_mode = restored[3] & (plugin.termios.ICANON | plugin.termios.ECHO)
+        original_mode = original[3] & (plugin.termios.ICANON | plugin.termios.ECHO)
+        self.assertEqual(restored_mode, original_mode)
+        self.assertEqual(restored[6][plugin.termios.VMIN], original[6][plugin.termios.VMIN])
+        self.assertEqual(restored[6][plugin.termios.VTIME], original[6][plugin.termios.VTIME])
+        self.assertEqual(output.getvalue(), "\033[?25l\033[?25h")
+
+    def test_cleanup_choice_supports_enter_escape_and_korean_layout_keys(self):
+        self.assertEqual(plugin.normalize_cleanup_choice(""), "")
+        self.assertEqual(plugin.normalize_cleanup_choice("ㅇ"), "d")
+        self.assertEqual(plugin.normalize_cleanup_choice("ㄹ"), "f")
+        self.assertEqual(plugin.normalize_cleanup_choice("ㄴ"), "s")
+        self.assertEqual(plugin.normalize_cleanup_choice("ㅂ"), "q")
+        self.assertEqual(plugin.normalize_cleanup_choice("ㅏ"), "k")
+
+
 class GitRepositoryTestCase(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -167,6 +391,24 @@ class RepositoryResolutionTests(GitRepositoryTestCase):
     def test_no_configuration_is_a_successful_noop(self):
         with self.assertRaises(plugin.NothingToDo):
             plugin.execute_action("bootstrap", self.context, self.state_dir)
+
+    def test_bootstrap_entrypoint_caches_worktree_even_without_configuration(self):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            result = plugin.main(
+                [
+                    "bootstrap",
+                    "--target",
+                    os.fspath(self.target),
+                    "--state-dir",
+                    os.fspath(self.state_dir),
+                ],
+                env={},
+            )
+        self.assertEqual(result, 0)
+        mapping = plugin.load_worktree_mapping(self.state_dir, self.target)
+        self.assertEqual(mapping["branch"], "feature")
+        self.assertEqual(Path(mapping["repo_root"]), self.source.resolve())
 
 
 class CopyBehaviorTests(GitRepositoryTestCase):
@@ -411,6 +653,203 @@ class StateAndManagementTests(GitRepositoryTestCase):
                 self.assertEqual(plugin.manage(self.context, self.state_dir), 0)
         exclude = self.context.common_git_dir / "info" / "exclude"
         self.assertIn("/.herdr/worktree-setup.json", exclude.read_text(encoding="utf-8"))
+
+
+class BranchCleanupTests(GitRepositoryTestCase):
+    def removed_event(self, *, workspace=True, branch="feature", detached=False, forced=False):
+        workspace_value = None
+        if workspace:
+            workspace_value = {
+                "workspace_id": "w2",
+                "worktree": {
+                    "repo_root": os.fspath(self.source.resolve()),
+                    "repo_key": os.fspath((self.source / ".git").resolve()),
+                    "repo_name": self.source.name,
+                    "checkout_path": os.fspath(self.target.resolve()),
+                    "is_linked_worktree": True,
+                },
+            }
+        return {
+            "HERDR_PLUGIN_EVENT": "worktree.removed",
+            "HERDR_PLUGIN_EVENT_JSON": json.dumps(
+                {
+                    "event": "worktree.removed",
+                    "data": {
+                        "type": "worktree_removed",
+                        "workspace_id": "w2",
+                        "workspace": workspace_value,
+                        "worktree": {
+                            "path": os.fspath(self.target.resolve()),
+                            "branch": branch,
+                            "is_bare": False,
+                            "is_detached": detached,
+                            "is_prunable": False,
+                            "is_linked_worktree": True,
+                            "label": branch,
+                        },
+                        "forced": forced,
+                    },
+                }
+            ),
+        }
+
+    def record_and_remove_target(self):
+        plugin.record_worktree_mapping(self.context, self.state_dir)
+        run(["git", "worktree", "remove", os.fspath(self.target)], cwd=self.source)
+
+    def branch_exists(self, branch):
+        result = run(
+            ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+            cwd=self.source,
+            check=False,
+        )
+        return result.returncode == 0
+
+    def test_removed_event_queues_and_safely_deletes_merged_branch(self):
+        self.record_and_remove_target()
+        pending = plugin.handle_branch_cleanup_event(
+            self.removed_event(), self.state_dir, open_popup=False
+        )
+        self.assertEqual(pending["branch"], "feature")
+        self.assertFalse(pending["popup_opened"])
+        inspection = plugin.inspect_branch(self.source, "feature")
+        self.assertTrue(inspection.exists)
+        self.assertTrue(inspection.merged_into_default)
+        output = []
+        result = plugin.review_pending_cleanups(
+            self.state_dir,
+            input_fn=lambda prompt: "d",
+            output_fn=output.append,
+        )
+        self.assertEqual(result, 0)
+        self.assertFalse(self.branch_exists("feature"))
+        self.assertEqual(plugin.list_pending_cleanups(self.state_dir), [])
+
+    def test_keep_is_default_and_resolves_pending_without_deletion(self):
+        self.record_and_remove_target()
+        plugin.handle_branch_cleanup_event(self.removed_event(), self.state_dir, open_popup=False)
+        plugin.review_pending_cleanups(
+            self.state_dir,
+            input_fn=lambda prompt: "",
+            output_fn=lambda line: None,
+        )
+        self.assertTrue(self.branch_exists("feature"))
+        self.assertEqual(plugin.list_pending_cleanups(self.state_dir), [])
+        last = plugin._read_json_file(
+            self.state_dir / plugin.BRANCH_CLEANUP_DIR / "last-result.json"
+        )
+        self.assertEqual(last["outcome"], "kept")
+
+    def test_unmerged_branch_safe_delete_is_refused_and_force_requires_exact_name(self):
+        (self.target / "feature-only").write_text("unmerged", encoding="utf-8")
+        run(["git", "add", "feature-only"], cwd=self.target)
+        run(["git", "commit", "-qm", "feature only"], cwd=self.target)
+        self.record_and_remove_target()
+        plugin.handle_branch_cleanup_event(self.removed_event(), self.state_dir, open_popup=False)
+        answers = iter(["d", "f", "wrong", "f", "feature"])
+        output = []
+        plugin.review_pending_cleanups(
+            self.state_dir,
+            input_fn=lambda prompt: next(answers),
+            output_fn=output.append,
+        )
+        self.assertFalse(self.branch_exists("feature"))
+        self.assertTrue(any("Safe deletion refused" in line for line in output))
+        self.assertTrue(any("did not match" in line for line in output))
+        last = plugin._read_json_file(
+            self.state_dir / plugin.BRANCH_CLEANUP_DIR / "last-result.json"
+        )
+        self.assertEqual(last["outcome"], "deleted_forcibly")
+
+    def test_protected_branch_cannot_be_deleted(self):
+        primary_branch = run(["git", "branch", "--show-current"], cwd=self.source).stdout.strip()
+        pending_id = plugin.pending_cleanup_id(self.source, self.target, primary_branch)
+        plugin._atomic_write_json(
+            plugin.pending_cleanup_path(self.state_dir, pending_id),
+            {
+                "version": 1,
+                "id": pending_id,
+                "created_at": "2026-07-31T00:00:00+00:00",
+                "repo_root": os.fspath(self.source.resolve()),
+                "worktree_path": os.fspath(self.target.resolve()),
+                "branch": primary_branch,
+                "forced_worktree_removal": False,
+                "status": "pending",
+            },
+        )
+        output = []
+        plugin.review_pending_cleanups(
+            self.state_dir,
+            input_fn=lambda prompt: "k",
+            output_fn=output.append,
+        )
+        self.assertTrue(self.branch_exists(primary_branch))
+        self.assertTrue(any("Deletion blocked" in line for line in output))
+        with self.assertRaisesRegex(plugin.BootstrapError, "protected"):
+            plugin.delete_local_branch(self.source, primary_branch, force=True)
+
+    def test_branch_used_by_another_worktree_is_blocked(self):
+        self.record_and_remove_target()
+        other = self.root / "other feature checkout"
+        run(["git", "worktree", "add", os.fspath(other), "feature"], cwd=self.source)
+        plugin.handle_branch_cleanup_event(self.removed_event(), self.state_dir, open_popup=False)
+        inspection = plugin.inspect_branch(self.source, "feature")
+        self.assertIn(os.fspath(other.resolve()), inspection.used_by_worktrees)
+        with self.assertRaisesRegex(plugin.BootstrapError, "another worktree"):
+            plugin.delete_local_branch(self.source, "feature")
+
+    def test_branch_change_after_review_is_blocked(self):
+        self.record_and_remove_target()
+        inspection = plugin.inspect_branch(self.source, "feature")
+        with self.assertRaisesRegex(plugin.BootstrapError, "changed after it was displayed"):
+            plugin.delete_local_branch(
+                self.source,
+                "feature",
+                expected_oid="0" * 40,
+            )
+        self.assertTrue(self.branch_exists("feature"))
+
+    def test_workspace_null_uses_cached_primary_checkout(self):
+        self.record_and_remove_target()
+        pending = plugin.queue_branch_cleanup(
+            self.removed_event(workspace=False), self.state_dir
+        )
+        self.assertEqual(Path(pending["repo_root"]), self.source.resolve())
+
+    def test_detached_removed_worktree_is_a_noop(self):
+        plugin.record_worktree_mapping(self.context, self.state_dir)
+        mapping_path = plugin.worktree_map_path(self.state_dir, self.target)
+        self.assertTrue(mapping_path.exists())
+        with self.assertRaises(plugin.NothingToDo):
+            plugin.queue_branch_cleanup(
+                self.removed_event(branch=None, detached=True), self.state_dir
+            )
+        self.assertEqual(plugin.list_pending_cleanups(self.state_dir), [])
+        self.assertFalse(mapping_path.exists())
+
+    def test_popup_launch_passes_only_cleanup_id(self):
+        completed = subprocess.CompletedProcess([], 0, stdout="{}", stderr="")
+        with mock.patch.object(plugin.subprocess, "run", return_value=completed) as run_mock:
+            opened = plugin.launch_branch_cleanup_popup(
+                "a" * 24,
+                "feature",
+                {"HERDR_BIN_PATH": "/usr/local/bin/herdr"},
+            )
+        self.assertTrue(opened)
+        command = run_mock.call_args.args[0]
+        self.assertIn("HERDR_BRANCH_CLEANUP_ID=" + "a" * 24, command)
+        self.assertNotIn("feature", command)
+        self.assertEqual(command[command.index("--width") + 1], "68%")
+        self.assertEqual(command[command.index("--height") + 1], "50%")
+
+    def test_event_keeps_pending_when_popup_cannot_open(self):
+        self.record_and_remove_target()
+        with mock.patch.object(plugin, "launch_branch_cleanup_popup", return_value=False):
+            result = plugin.handle_branch_cleanup_event(
+                self.removed_event(), self.state_dir, open_popup=True
+            )
+        self.assertFalse(result["popup_opened"])
+        self.assertEqual(len(plugin.list_pending_cleanups(self.state_dir)), 1)
 
 
 if __name__ == "__main__":

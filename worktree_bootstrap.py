@@ -14,16 +14,22 @@ import dataclasses
 import datetime as dt
 import fcntl
 import hashlib
+import itertools
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
+import select
 import shutil
 import signal
 import stat
 import subprocess
 import sys
 import tempfile
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+import termios
+import time
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+import unicodedata
 import uuid
 
 
@@ -31,6 +37,14 @@ PLUGIN_ID = "zerodice0.worktree-bootstrap"
 COPY_LIST = Path(".herdr/worktree-copy.list")
 SETUP_FILE = Path(".herdr/worktree-setup.json")
 TXN_PREFIX = ".herdr-worktree-bootstrap-txn-"
+BRANCH_CLEANUP_DIR = "branch-cleanup"
+WORKTREE_MAP_DIR = "worktree-map"
+PROTECTED_BRANCHES = frozenset({"main", "master", "develop", "development", "trunk"})
+ANSI_RESET = "\033[0m"
+MIN_ACTION_FOOTER_COLUMNS = 32
+ACTION_GROUP_GAP = 4
+ColorValue = Optional[Union[int, Tuple[int, int, int]]]
+ActionSpec = Tuple[str, str, str]
 
 
 class BootstrapError(RuntimeError):
@@ -92,6 +106,459 @@ class SetupCommand:
     timeout_seconds: int
 
 
+@dataclasses.dataclass(frozen=True)
+class BranchInspection:
+    repo_root: Path
+    branch: str
+    exists: bool
+    protected: bool
+    protection_reason: Optional[str]
+    used_by_worktrees: Tuple[str, ...]
+    default_ref: Optional[str]
+    merged_into_default: Optional[bool]
+    upstream: Optional[str]
+    ahead: Optional[int]
+    behind: Optional[int]
+    last_commit: Optional[str]
+    head_oid: Optional[str]
+
+
+@dataclasses.dataclass(frozen=True)
+class ThemeSettings:
+    name: str = "catppuccin"
+    auto_switch: bool = False
+    dark_name: Optional[str] = None
+    light_name: Optional[str] = None
+    custom: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    legacy_accent: Optional[str] = None
+
+
+@dataclasses.dataclass(frozen=True)
+class ThemePalette:
+    name: str
+    accent: ColorValue
+    text: ColorValue
+    muted: ColorValue
+    subtle: ColorValue
+    branch: ColorValue
+    positive: ColorValue
+    warning: ColorValue
+    danger: ColorValue
+    info: ColorValue
+    peach: ColorValue
+
+
+def _rgb(red: int, green: int, blue: int) -> Tuple[int, int, int]:
+    return red, green, blue
+
+
+# Semantic colors mirror Herdr 0.7.5's built-in Palette definitions.  The
+# dialog deliberately leaves its background at the terminal default so the
+# session-modal popup keeps the active client's background and border chrome.
+HERDR_THEME_PALETTES: Mapping[str, ThemePalette] = {
+    "catppuccin": ThemePalette(
+        "catppuccin", _rgb(137, 180, 250), _rgb(205, 214, 244),
+        _rgb(166, 173, 200), _rgb(127, 132, 156), _rgb(203, 166, 247),
+        _rgb(166, 227, 161), _rgb(249, 226, 175), _rgb(243, 139, 168),
+        _rgb(137, 180, 250), _rgb(250, 179, 135),
+    ),
+    "catppuccin-latte": ThemePalette(
+        "catppuccin-latte", _rgb(30, 102, 245), _rgb(76, 79, 105),
+        _rgb(108, 111, 133), _rgb(140, 143, 161), _rgb(136, 57, 239),
+        _rgb(64, 160, 43), _rgb(223, 142, 29), _rgb(210, 15, 57),
+        _rgb(30, 102, 245), _rgb(254, 100, 11),
+    ),
+    "terminal": ThemePalette(
+        "terminal", 34, None, 90, 37, 35, 32, 33, 91, 34, 33,
+    ),
+    "tokyo-night": ThemePalette(
+        "tokyo-night", _rgb(122, 162, 247), _rgb(192, 202, 245),
+        _rgb(169, 177, 214), _rgb(105, 113, 150), _rgb(187, 154, 247),
+        _rgb(158, 206, 106), _rgb(224, 175, 104), _rgb(247, 118, 142),
+        _rgb(122, 162, 247), _rgb(255, 158, 100),
+    ),
+    "tokyo-night-day": ThemePalette(
+        "tokyo-night-day", _rgb(46, 125, 233), _rgb(55, 96, 191),
+        _rgb(97, 114, 176), _rgb(104, 112, 154), _rgb(120, 71, 189),
+        _rgb(88, 117, 57), _rgb(140, 108, 62), _rgb(245, 42, 101),
+        _rgb(46, 125, 233), _rgb(177, 92, 0),
+    ),
+    "dracula": ThemePalette(
+        "dracula", _rgb(189, 147, 249), _rgb(248, 248, 242),
+        _rgb(210, 210, 220), _rgb(130, 140, 180), _rgb(255, 121, 198),
+        _rgb(80, 250, 123), _rgb(241, 250, 140), _rgb(255, 85, 85),
+        _rgb(139, 233, 253), _rgb(255, 184, 108),
+    ),
+    "nord": ThemePalette(
+        "nord", _rgb(136, 192, 208), _rgb(236, 239, 244),
+        _rgb(216, 222, 233), _rgb(100, 110, 130), _rgb(180, 142, 173),
+        _rgb(163, 190, 140), _rgb(235, 203, 139), _rgb(191, 97, 106),
+        _rgb(129, 161, 193), _rgb(208, 135, 112),
+    ),
+    "gruvbox": ThemePalette(
+        "gruvbox", _rgb(215, 153, 33), _rgb(235, 219, 178),
+        _rgb(213, 196, 161), _rgb(168, 153, 132), _rgb(211, 134, 155),
+        _rgb(184, 187, 38), _rgb(250, 189, 47), _rgb(251, 73, 52),
+        _rgb(131, 165, 152), _rgb(254, 128, 25),
+    ),
+    "gruvbox-light": ThemePalette(
+        "gruvbox-light", _rgb(7, 102, 120), _rgb(60, 56, 54),
+        _rgb(80, 73, 69), _rgb(124, 111, 100), _rgb(143, 63, 113),
+        _rgb(121, 116, 14), _rgb(181, 118, 20), _rgb(157, 0, 6),
+        _rgb(7, 102, 120), _rgb(175, 58, 3),
+    ),
+    "one-dark": ThemePalette(
+        "one-dark", _rgb(97, 175, 239), _rgb(171, 178, 191),
+        _rgb(150, 156, 168), _rgb(115, 122, 135), _rgb(198, 120, 221),
+        _rgb(152, 195, 121), _rgb(229, 192, 123), _rgb(224, 108, 117),
+        _rgb(97, 175, 239), _rgb(209, 154, 102),
+    ),
+    "one-light": ThemePalette(
+        "one-light", _rgb(64, 120, 242), _rgb(56, 58, 66),
+        _rgb(104, 107, 119), _rgb(104, 107, 119), _rgb(166, 38, 164),
+        _rgb(80, 161, 79), _rgb(193, 132, 1), _rgb(228, 86, 73),
+        _rgb(64, 120, 242), _rgb(152, 104, 1),
+    ),
+    "solarized": ThemePalette(
+        "solarized", _rgb(38, 139, 210), _rgb(147, 161, 161),
+        _rgb(131, 148, 150), _rgb(101, 123, 131), _rgb(211, 54, 130),
+        _rgb(133, 153, 0), _rgb(181, 137, 0), _rgb(220, 50, 47),
+        _rgb(38, 139, 210), _rgb(203, 75, 22),
+    ),
+    "solarized-light": ThemePalette(
+        "solarized-light", _rgb(38, 139, 210), _rgb(101, 123, 131),
+        _rgb(131, 148, 150), _rgb(88, 110, 117), _rgb(211, 54, 130),
+        _rgb(133, 153, 0), _rgb(181, 137, 0), _rgb(220, 50, 47),
+        _rgb(38, 139, 210), _rgb(203, 75, 22),
+    ),
+    "kanagawa": ThemePalette(
+        "kanagawa", _rgb(126, 156, 216), _rgb(220, 215, 186),
+        _rgb(200, 195, 170), _rgb(135, 134, 125), _rgb(149, 127, 184),
+        _rgb(118, 148, 106), _rgb(192, 163, 110), _rgb(195, 64, 67),
+        _rgb(126, 156, 216), _rgb(255, 160, 102),
+    ),
+    "kanagawa-lotus": ThemePalette(
+        "kanagawa-lotus", _rgb(77, 105, 155), _rgb(84, 84, 100),
+        _rgb(67, 67, 108), _rgb(138, 137, 128), _rgb(98, 76, 131),
+        _rgb(111, 137, 78), _rgb(119, 113, 63), _rgb(200, 64, 83),
+        _rgb(77, 105, 155), _rgb(204, 109, 0),
+    ),
+    "rose-pine": ThemePalette(
+        "rose-pine", _rgb(196, 167, 231), _rgb(224, 222, 244),
+        _rgb(200, 197, 220), _rgb(144, 140, 170), _rgb(196, 167, 231),
+        _rgb(49, 116, 143), _rgb(246, 193, 119), _rgb(235, 111, 146),
+        _rgb(49, 116, 143), _rgb(234, 154, 151),
+    ),
+    "rose-pine-dawn": ThemePalette(
+        "rose-pine-dawn", _rgb(144, 122, 169), _rgb(70, 66, 97),
+        _rgb(121, 117, 147), _rgb(121, 117, 147), _rgb(144, 122, 169),
+        _rgb(40, 105, 131), _rgb(234, 157, 52), _rgb(180, 99, 122),
+        _rgb(40, 105, 131), _rgb(215, 130, 126),
+    ),
+    "vesper": ThemePalette(
+        "vesper", _rgb(255, 199, 153), _rgb(255, 255, 255),
+        _rgb(160, 160, 160), _rgb(126, 126, 126), _rgb(255, 209, 168),
+        _rgb(153, 255, 228), _rgb(255, 199, 153), _rgb(255, 128, 128),
+        _rgb(176, 176, 176), _rgb(255, 199, 153),
+    ),
+}
+
+
+HERDR_THEME_ALIASES: Mapping[str, str] = {
+    "catppuccin-mocha": "catppuccin",
+    "latte": "catppuccin-latte",
+    "light": "catppuccin-latte",
+    "tokyonight": "tokyo-night",
+    "tokyo-day": "tokyo-night-day",
+    "tokyonight-day": "tokyo-night-day",
+    "gruvbox-dark": "gruvbox",
+    "onedark": "one-dark",
+    "onelight": "one-light",
+    "solarized-dark": "solarized",
+    "lotus": "kanagawa-lotus",
+    "rosepine": "rose-pine",
+    "rosepine-dawn": "rose-pine-dawn",
+    "dawn": "rose-pine-dawn",
+}
+
+
+THEME_CUSTOM_TO_PALETTE: Mapping[str, str] = {
+    "accent": "accent",
+    "text": "text",
+    "subtext0": "muted",
+    "overlay1": "subtle",
+    "mauve": "branch",
+    "green": "positive",
+    "yellow": "warning",
+    "red": "danger",
+    "blue": "info",
+    "peach": "peach",
+}
+
+NAMED_THEME_COLORS: Mapping[str, int] = {
+    "black": 30,
+    "red": 31,
+    "green": 32,
+    "yellow": 33,
+    "blue": 34,
+    "magenta": 35,
+    "purple": 35,
+    "cyan": 36,
+    "white": 37,
+    "gray": 37,
+    "grey": 37,
+    "darkgray": 90,
+    "darkgrey": 90,
+    "lightred": 91,
+    "lightgreen": 92,
+    "lightyellow": 93,
+    "lightblue": 94,
+    "lightmagenta": 95,
+    "lightcyan": 96,
+}
+
+_INVALID_THEME_COLOR = object()
+
+
+def _normalize_theme_name(value: str) -> str:
+    return value.strip().lower().replace(" ", "-").replace("_", "-")
+
+
+def _strip_toml_comment(line: str) -> str:
+    quote: Optional[str] = None
+    escaped = False
+    result: List[str] = []
+    for character in line:
+        if escaped:
+            result.append(character)
+            escaped = False
+            continue
+        if quote == '"' and character == "\\":
+            result.append(character)
+            escaped = True
+            continue
+        if character in ("'", '"'):
+            if quote is None:
+                quote = character
+            elif quote == character:
+                quote = None
+            result.append(character)
+            continue
+        if character == "#" and quote is None:
+            break
+        result.append(character)
+    return "".join(result).strip()
+
+
+def _parse_theme_scalar(value: str) -> Optional[Union[str, bool]]:
+    value = value.strip()
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    if len(value) >= 2 and value[0] == value[-1] == "'":
+        return value[1:-1]
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        return parsed if isinstance(parsed, str) else None
+    return None
+
+
+def _theme_config_path(env: Mapping[str, str]) -> Path:
+    configured = env.get("HERDR_CONFIG_PATH")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".config" / "herdr" / "config.toml"
+
+
+def load_theme_settings(
+    env: Mapping[str, str],
+    *,
+    config_path: Optional[Path] = None,
+) -> ThemeSettings:
+    path = config_path if config_path is not None else _theme_config_path(env)
+    try:
+        contents = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return ThemeSettings()
+
+    section = ""
+    values: Dict[str, Union[str, bool]] = {}
+    custom: Dict[str, str] = {}
+    legacy_accent: Optional[str] = None
+    for raw_line in contents.splitlines():
+        line = _strip_toml_comment(raw_line)
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip()
+            continue
+        if "=" not in line:
+            continue
+        raw_key, raw_value = line.split("=", 1)
+        key = raw_key.strip()
+        parsed = _parse_theme_scalar(raw_value)
+        if parsed is None:
+            continue
+        if section == "theme" and key in ("name", "auto_switch", "dark_name", "light_name"):
+            values[key] = parsed
+        elif section == "theme.custom" and key in THEME_CUSTOM_TO_PALETTE:
+            if isinstance(parsed, str):
+                custom[key] = parsed
+        elif section == "ui" and key == "accent" and isinstance(parsed, str):
+            legacy_accent = parsed
+
+    name = values.get("name")
+    auto_switch = values.get("auto_switch")
+    dark_name = values.get("dark_name")
+    light_name = values.get("light_name")
+    return ThemeSettings(
+        name=name if isinstance(name, str) and name.strip() else "catppuccin",
+        auto_switch=auto_switch if isinstance(auto_switch, bool) else False,
+        dark_name=dark_name if isinstance(dark_name, str) and dark_name.strip() else None,
+        light_name=light_name if isinstance(light_name, str) and light_name.strip() else None,
+        custom=custom,
+        legacy_accent=legacy_accent,
+    )
+
+
+def _theme_siblings(name: str) -> Tuple[str, str]:
+    normalized = HERDR_THEME_ALIASES.get(_normalize_theme_name(name), _normalize_theme_name(name))
+    if normalized in ("catppuccin", "catppuccin-latte"):
+        return "catppuccin", "catppuccin-latte"
+    if normalized in ("tokyo-night", "tokyo-night-day"):
+        return "tokyo-night", "tokyo-night-day"
+    if normalized in ("gruvbox", "gruvbox-light"):
+        return "gruvbox", "gruvbox-light"
+    if normalized in ("one-dark", "one-light"):
+        return "one-dark", "one-light"
+    if normalized in ("solarized", "solarized-light"):
+        return "solarized", "solarized-light"
+    if normalized in ("kanagawa", "kanagawa-lotus"):
+        return "kanagawa", "kanagawa-lotus"
+    if normalized in ("rose-pine", "rose-pine-dawn"):
+        return "rose-pine", "rose-pine-dawn"
+    return normalized, normalized
+
+
+def _parse_theme_color(value: str) -> Any:
+    normalized = value.strip().lower()
+    if normalized in ("reset", "default", "none", "transparent"):
+        return None
+    if normalized in NAMED_THEME_COLORS:
+        return NAMED_THEME_COLORS[normalized]
+    if normalized.startswith("#"):
+        hexadecimal = normalized[1:]
+        if len(hexadecimal) == 3 and all(character in "0123456789abcdef" for character in hexadecimal):
+            return tuple(int(character * 2, 16) for character in hexadecimal)
+        if len(hexadecimal) == 6 and all(character in "0123456789abcdef" for character in hexadecimal):
+            return tuple(int(hexadecimal[index:index + 2], 16) for index in (0, 2, 4))
+        return _INVALID_THEME_COLOR
+    match = re.fullmatch(r"rgb\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)", normalized)
+    if match:
+        components = tuple(int(component) for component in match.groups())
+        return components if all(component <= 255 for component in components) else _INVALID_THEME_COLOR
+    return _INVALID_THEME_COLOR
+
+
+def resolve_theme_palette(
+    settings: ThemeSettings,
+    *,
+    appearance: Optional[str] = None,
+) -> ThemePalette:
+    requested_name = settings.name
+    fallback_name = "catppuccin"
+    if settings.auto_switch:
+        dark_name, light_name = _theme_siblings(settings.name)
+        if appearance == "light":
+            requested_name = settings.light_name or light_name
+            fallback_name = "catppuccin-latte"
+        else:
+            requested_name = settings.dark_name or dark_name
+    normalized = _normalize_theme_name(requested_name)
+    normalized = HERDR_THEME_ALIASES.get(normalized, normalized)
+    palette = HERDR_THEME_PALETTES.get(normalized, HERDR_THEME_PALETTES[fallback_name])
+
+    replacements: Dict[str, ColorValue] = {}
+    for custom_name, value in settings.custom.items():
+        parsed = _parse_theme_color(value)
+        if parsed is not _INVALID_THEME_COLOR:
+            replacements[THEME_CUSTOM_TO_PALETTE[custom_name]] = parsed
+    if "accent" not in replacements and settings.legacy_accent:
+        parsed_accent = _parse_theme_color(settings.legacy_accent)
+        if parsed_accent is not _INVALID_THEME_COLOR:
+            replacements["accent"] = parsed_accent
+    if replacements:
+        palette = dataclasses.replace(palette, **replacements)
+    return dataclasses.replace(palette, name=normalized if normalized in HERDR_THEME_PALETTES else fallback_name)
+
+
+def _parse_terminal_rgb_component(value: str) -> Optional[int]:
+    if not value or len(value) > 4 or any(character not in "0123456789abcdefABCDEF" for character in value):
+        return None
+    raw = int(value, 16)
+    maximum = (1 << (len(value) * 4)) - 1
+    return (raw * 255 + maximum // 2) // maximum
+
+
+def _appearance_from_terminal_response(response: str) -> Optional[str]:
+    match = re.search(r"\x1b\]11;rgb:([^/]+)/([^/]+)/([^\x07\x1b]+)(?:\x07|\x1b\\)", response)
+    if not match:
+        match = re.search(r"\x1b\]11;#([0-9a-fA-F]{6})(?:\x07|\x1b\\)", response)
+        if not match:
+            return None
+        hexadecimal = match.group(1)
+        red, green, blue = (int(hexadecimal[index:index + 2], 16) for index in (0, 2, 4))
+    else:
+        components = tuple(_parse_terminal_rgb_component(value) for value in match.groups())
+        if any(component is None for component in components):
+            return None
+        red, green, blue = components  # type: ignore[misc]
+    luminance = red * 299 + green * 587 + blue * 114
+    return "light" if luminance >= 128_000 else "dark"
+
+
+def query_terminal_appearance(timeout_seconds: float = 0.15) -> Optional[str]:
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        return None
+    input_fd = sys.stdin.fileno()
+    try:
+        original = termios.tcgetattr(input_fd)
+    except (OSError, termios.error):
+        return None
+    collected = bytearray()
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        updated = list(original)
+        updated[3] &= ~(termios.ICANON | termios.ECHO)
+        updated[6][termios.VMIN] = 0
+        updated[6][termios.VTIME] = 0
+        termios.tcsetattr(input_fd, termios.TCSANOW, updated)
+        sys.stdout.write("\033]11;?\033\\")
+        sys.stdout.flush()
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([input_fd], [], [], max(0.0, deadline - time.monotonic()))
+            if not ready:
+                break
+            chunk = os.read(input_fd, 256)
+            if not chunk:
+                break
+            collected.extend(chunk)
+            decoded = collected.decode("ascii", errors="ignore")
+            appearance = _appearance_from_terminal_response(decoded)
+            if appearance:
+                return appearance
+    except (OSError, termios.error):
+        return None
+    finally:
+        with contextlib.suppress(OSError, termios.error):
+            termios.tcsetattr(input_fd, termios.TCSANOW, original)
+    return None
+
+
 def _run_git(
     cwd: Path,
     args: Sequence[str],
@@ -138,15 +605,28 @@ def _is_bare(path: Path) -> bool:
     return result.stdout.strip() == "true"
 
 
+def parse_worktree_records(raw: bytes) -> List[Mapping[str, Any]]:
+    """Parse `git worktree list --porcelain -z` without path quoting."""
+
+    records: List[Mapping[str, Any]] = []
+    current: Dict[str, Any] = {}
+    for field in raw.split(b"\0"):
+        if not field:
+            if current:
+                records.append(current)
+                current = {}
+            continue
+        key, separator, value = field.partition(b" ")
+        current[os.fsdecode(key)] = os.fsdecode(value) if separator else True
+    if current:
+        records.append(current)
+    return records
+
+
 def parse_worktree_porcelain(raw: bytes) -> List[Path]:
     """Extract worktree paths from `git worktree list --porcelain -z`."""
 
-    paths: List[Path] = []
-    for field in raw.split(b"\0"):
-        if field.startswith(b"worktree "):
-            value = field[len(b"worktree ") :]
-            paths.append(Path(os.fsdecode(value)))
-    return paths
+    return [Path(record["worktree"]) for record in parse_worktree_records(raw) if "worktree" in record]
 
 
 def find_primary_checkout(target: Path, common_git_dir: Path) -> Optional[Path]:
@@ -586,6 +1066,1069 @@ def default_state_dir(env: Mapping[str, str]) -> Path:
     return Path.home() / ".local" / "state" / "herdr" / "plugins" / PLUGIN_ID
 
 
+def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=os.fspath(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(dict(payload), handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary)
+
+
+def _read_json_file(path: Path) -> Optional[Mapping[str, Any]]:
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return document if isinstance(document, dict) else None
+
+
+def _path_state_key(path: Path) -> str:
+    encoded = os.fspath(_canonical(path)).encode("utf-8", "surrogateescape")
+    return hashlib.sha256(encoded).hexdigest()[:24]
+
+
+def worktree_map_path(state_dir: Path, target: Path) -> Path:
+    return state_dir / WORKTREE_MAP_DIR / f"{_path_state_key(target)}.json"
+
+
+def record_worktree_mapping(context: RepositoryContext, state_dir: Path) -> None:
+    if context.target_is_primary:
+        return
+    branch_result = _run_git(
+        context.target,
+        ["symbolic-ref", "--quiet", "--short", "HEAD"],
+        check=False,
+    )
+    branch = branch_result.stdout.strip() if branch_result.returncode == 0 else None
+    payload: Dict[str, Any] = {
+        "version": 1,
+        "target": os.fspath(context.target),
+        "repo_root": os.fspath(context.source),
+        "common_git_dir": os.fspath(context.common_git_dir),
+        "branch": branch or None,
+        "recorded_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+    _atomic_write_json(worktree_map_path(state_dir, context.target), payload)
+
+
+def load_worktree_mapping(state_dir: Path, target: Path) -> Optional[Mapping[str, Any]]:
+    return _read_json_file(worktree_map_path(state_dir, target))
+
+
+def _pending_cleanup_dir(state_dir: Path) -> Path:
+    return state_dir / BRANCH_CLEANUP_DIR / "pending"
+
+
+def pending_cleanup_id(repo_root: Path, worktree_path: Path, branch: str) -> str:
+    raw = f"{_canonical(repo_root)}\0{_canonical(worktree_path)}\0{branch}".encode(
+        "utf-8", "surrogateescape"
+    )
+    return hashlib.sha256(raw).hexdigest()[:24]
+
+
+def pending_cleanup_path(state_dir: Path, cleanup_id: str) -> Path:
+    if not cleanup_id or any(character not in "0123456789abcdef" for character in cleanup_id):
+        raise BootstrapError("invalid branch cleanup id")
+    return _pending_cleanup_dir(state_dir) / f"{cleanup_id}.json"
+
+
+def list_pending_cleanups(state_dir: Path) -> List[Mapping[str, Any]]:
+    directory = _pending_cleanup_dir(state_dir)
+    if not directory.exists():
+        return []
+    records: List[Mapping[str, Any]] = []
+    for path in sorted(directory.glob("*.json")):
+        document = _read_json_file(path)
+        if document is None:
+            continue
+        record = dict(document)
+        record["_path"] = os.fspath(path)
+        records.append(record)
+    return sorted(records, key=lambda item: str(item.get("created_at", "")))
+
+
+def _normalize_local_branch(branch: str) -> str:
+    value = branch.strip()
+    prefix = "refs/heads/"
+    if value.startswith(prefix):
+        value = value[len(prefix) :]
+    if not value or "\x00" in value:
+        raise BootstrapError("removed worktree did not provide a valid local branch")
+    return value
+
+
+def _removed_event_details(env: Mapping[str, str]) -> Tuple[Path, Optional[Path], str, bool]:
+    envelope = _decode_json_env(env, "HERDR_PLUGIN_EVENT_JSON")
+    if envelope is None:
+        raise BootstrapError("HERDR_PLUGIN_EVENT_JSON is required for branch cleanup")
+    event_name = env.get("HERDR_PLUGIN_EVENT") or envelope.get("event")
+    if event_name != "worktree.removed":
+        raise NothingToDo("event is not worktree.removed; nothing was queued")
+    data = envelope.get("data")
+    if not isinstance(data, dict):
+        raise BootstrapError("worktree.removed event data is missing")
+    worktree = data.get("worktree")
+    if not isinstance(worktree, dict):
+        raise BootstrapError("worktree.removed event has no worktree record")
+    raw_path = worktree.get("path")
+    if not isinstance(raw_path, str) or not raw_path:
+        raise BootstrapError("worktree.removed event has no worktree path")
+    raw_branch = worktree.get("branch")
+    if raw_branch is None or worktree.get("is_detached") is True:
+        raise NothingToDo("removed worktree was detached; no local branch cleanup is needed")
+    if not isinstance(raw_branch, str):
+        raise BootstrapError("worktree.removed branch must be a string")
+    branch = _normalize_local_branch(raw_branch)
+    repo_root: Optional[Path] = None
+    workspace = data.get("workspace")
+    if isinstance(workspace, dict):
+        provenance = workspace.get("worktree")
+        if isinstance(provenance, dict) and isinstance(provenance.get("repo_root"), str):
+            repo_root = _canonical(Path(provenance["repo_root"]))
+    return _canonical(Path(raw_path)), repo_root, branch, bool(data.get("forced", False))
+
+
+def _validate_cleanup_repository(repo_root: Path, expected_common: Optional[str] = None) -> Path:
+    if not repo_root.exists():
+        raise BootstrapError(f"branch cleanup repository is unavailable: {repo_root}")
+    if _is_bare(repo_root):
+        raise BootstrapError("branch cleanup requires a non-bare primary checkout")
+    resolved = _git_root(repo_root)
+    common = _git_common_dir(resolved)
+    if expected_common and common != _canonical(Path(expected_common)):
+        raise BootstrapError("cached worktree and cleanup repository no longer share a Git directory")
+    return resolved
+
+
+def queue_branch_cleanup(env: Mapping[str, str], state_dir: Path) -> Mapping[str, Any]:
+    try:
+        worktree_path, event_repo_root, branch, forced = _removed_event_details(env)
+    except NothingToDo:
+        envelope = _decode_json_env(env, "HERDR_PLUGIN_EVENT_JSON")
+        data = envelope.get("data") if isinstance(envelope, dict) else None
+        worktree = data.get("worktree") if isinstance(data, dict) else None
+        raw_path = worktree.get("path") if isinstance(worktree, dict) else None
+        if isinstance(raw_path, str) and raw_path:
+            with contextlib.suppress(OSError):
+                worktree_map_path(state_dir, Path(raw_path)).unlink()
+        raise
+    mapping = load_worktree_mapping(state_dir, worktree_path)
+    cached_repo = mapping.get("repo_root") if isinstance(mapping, dict) else None
+    repo_candidate = event_repo_root
+    if repo_candidate is None and isinstance(cached_repo, str):
+        repo_candidate = Path(cached_repo)
+    if repo_candidate is None:
+        raise BootstrapError("cannot identify the primary checkout for removed worktree")
+    expected_common = mapping.get("common_git_dir") if isinstance(mapping, dict) else None
+    repo_root = _validate_cleanup_repository(
+        _canonical(repo_candidate),
+        expected_common if isinstance(expected_common, str) else None,
+    )
+    branch_check = _run_git(repo_root, ["check-ref-format", "--branch", branch], check=False)
+    if branch_check.returncode != 0:
+        raise BootstrapError("removed worktree reported an invalid branch name")
+    cleanup_id = pending_cleanup_id(repo_root, worktree_path, branch)
+    payload: Dict[str, Any] = {
+        "version": 1,
+        "id": cleanup_id,
+        "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "repo_root": os.fspath(repo_root),
+        "worktree_path": os.fspath(worktree_path),
+        "branch": branch,
+        "forced_worktree_removal": forced,
+        "status": "pending",
+    }
+    _atomic_write_json(pending_cleanup_path(state_dir, cleanup_id), payload)
+    with contextlib.suppress(OSError):
+        worktree_map_path(state_dir, worktree_path).unlink()
+    return payload
+
+
+def _ref_exists(repo_root: Path, ref: str) -> bool:
+    result = _run_git(repo_root, ["show-ref", "--verify", "--quiet", ref], check=False)
+    if result.returncode not in (0, 1):
+        raise BootstrapError(f"could not inspect Git ref: {ref}")
+    return result.returncode == 0
+
+
+def _default_branch_ref(repo_root: Path) -> Optional[str]:
+    symbolic = _run_git(
+        repo_root,
+        ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+        check=False,
+    )
+    if symbolic.returncode == 0 and symbolic.stdout.strip():
+        return symbolic.stdout.strip()
+    for candidate in ("main", "master", "trunk", "develop", "development"):
+        if _ref_exists(repo_root, f"refs/heads/{candidate}"):
+            return candidate
+    return None
+
+
+def inspect_branch(repo_root: Path, branch: str) -> BranchInspection:
+    repo_root = _validate_cleanup_repository(_canonical(repo_root))
+    branch = _normalize_local_branch(branch)
+    if _run_git(repo_root, ["check-ref-format", "--branch", branch], check=False).returncode != 0:
+        raise BootstrapError("invalid local branch name")
+    exists = _ref_exists(repo_root, f"refs/heads/{branch}")
+    default_ref = _default_branch_ref(repo_root)
+    default_name = default_ref.split("/", 1)[-1] if default_ref else None
+    protected = branch in PROTECTED_BRANCHES or branch == default_name
+    protection_reason = "protected/default branch" if protected else None
+
+    used_by: List[str] = []
+    records_result = _run_git(repo_root, ["worktree", "list", "--porcelain", "-z"], text=False)
+    for record in parse_worktree_records(records_result.stdout):
+        if record.get("branch") == f"refs/heads/{branch}" and isinstance(record.get("worktree"), str):
+            used_by.append(str(record["worktree"]))
+
+    upstream: Optional[str] = None
+    ahead: Optional[int] = None
+    behind: Optional[int] = None
+    last_commit: Optional[str] = None
+    head_oid: Optional[str] = None
+    merged: Optional[bool] = None
+    if exists:
+        oid_result = _run_git(
+            repo_root,
+            ["rev-parse", "--verify", f"refs/heads/{branch}"],
+            check=False,
+        )
+        if oid_result.returncode == 0 and oid_result.stdout.strip():
+            head_oid = oid_result.stdout.strip()
+        upstream_result = _run_git(
+            repo_root,
+            ["for-each-ref", "--format=%(upstream:short)", f"refs/heads/{branch}"],
+            check=False,
+        )
+        if upstream_result.returncode == 0 and upstream_result.stdout.strip():
+            upstream = upstream_result.stdout.strip()
+            counts = _run_git(
+                repo_root,
+                ["rev-list", "--left-right", "--count", f"{branch}...{upstream}"],
+                check=False,
+            )
+            if counts.returncode == 0:
+                parts = counts.stdout.split()
+                if len(parts) == 2 and all(part.isdigit() for part in parts):
+                    ahead, behind = int(parts[0]), int(parts[1])
+        if default_ref and _ref_exists(
+            repo_root,
+            default_ref if default_ref.startswith("refs/") else (
+                f"refs/remotes/{default_ref}" if "/" in default_ref else f"refs/heads/{default_ref}"
+            ),
+        ):
+            merged_result = _run_git(
+                repo_root,
+                ["merge-base", "--is-ancestor", branch, default_ref],
+                check=False,
+            )
+            if merged_result.returncode in (0, 1):
+                merged = merged_result.returncode == 0
+        commit_result = _run_git(
+            repo_root,
+            ["log", "-1", "--format=%h %s", f"refs/heads/{branch}"],
+            check=False,
+        )
+        if commit_result.returncode == 0 and commit_result.stdout.strip():
+            last_commit = commit_result.stdout.strip()
+
+    return BranchInspection(
+        repo_root=repo_root,
+        branch=branch,
+        exists=exists,
+        protected=protected,
+        protection_reason=protection_reason,
+        used_by_worktrees=tuple(used_by),
+        default_ref=default_ref,
+        merged_into_default=merged,
+        upstream=upstream,
+        ahead=ahead,
+        behind=behind,
+        last_commit=last_commit,
+        head_oid=head_oid,
+    )
+
+
+def delete_local_branch(
+    repo_root: Path,
+    branch: str,
+    *,
+    force: bool = False,
+    expected_oid: Optional[str] = None,
+) -> None:
+    inspection = inspect_branch(repo_root, branch)
+    if not inspection.exists:
+        return
+    if inspection.protected:
+        raise BootstrapError(f"refusing to delete protected branch: {branch}")
+    if inspection.used_by_worktrees:
+        raise BootstrapError("refusing to delete a branch used by another worktree")
+    if expected_oid is not None and inspection.head_oid != expected_oid:
+        raise BootstrapError("branch changed after it was displayed; review it again")
+    flag = "-D" if force else "-d"
+    result = _run_git(inspection.repo_root, ["branch", flag, "--", inspection.branch], check=False)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or "Git refused the branch deletion"
+        raise BootstrapError(detail)
+
+
+def _record_cleanup_result(
+    state_dir: Path,
+    record: Mapping[str, Any],
+    outcome: str,
+    *,
+    error: Optional[str] = None,
+) -> None:
+    payload: Dict[str, Any] = {
+        "version": 1,
+        "finished_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "id": record.get("id"),
+        "repo_root": record.get("repo_root"),
+        "branch": record.get("branch"),
+        "outcome": outcome,
+    }
+    if error:
+        payload["error"] = error
+    _atomic_write_json(state_dir / BRANCH_CLEANUP_DIR / "last-result.json", payload)
+
+
+def _resolve_pending_cleanup(
+    state_dir: Path,
+    record: Mapping[str, Any],
+    outcome: str,
+) -> None:
+    _record_cleanup_result(state_dir, record, outcome)
+    cleanup_id = record.get("id")
+    if isinstance(cleanup_id, str):
+        with contextlib.suppress(FileNotFoundError):
+            pending_cleanup_path(state_dir, cleanup_id).unlink()
+
+
+def _yes_no_unknown(value: Optional[bool]) -> str:
+    if value is True:
+        return "yes"
+    if value is False:
+        return "no"
+    return "unknown"
+
+
+def _safe_terminal_text(value: Any, limit: int = 240) -> str:
+    text = str(value)
+    sanitized = "".join(
+        character if ord(character) >= 32 and ord(character) != 127 else " "
+        for character in text
+    )
+    return " ".join(sanitized.split())[:limit]
+
+
+@dataclasses.dataclass(frozen=True)
+class StyledSegment:
+    text: str
+    role: str = "text"
+    bold: bool = False
+    dim: bool = False
+
+
+def _display_width(value: str) -> int:
+    width = 0
+    for character in value:
+        if unicodedata.combining(character):
+            continue
+        width += 2 if unicodedata.east_asian_width(character) in ("W", "F") else 1
+    return width
+
+
+def _truncate_display(value: str, maximum: int) -> str:
+    if maximum <= 0:
+        return ""
+    if _display_width(value) <= maximum:
+        return value
+    if maximum == 1:
+        return "…"
+    result: List[str] = []
+    used = 0
+    target = maximum - 1
+    for character in value:
+        character_width = 0 if unicodedata.combining(character) else (
+            2 if unicodedata.east_asian_width(character) in ("W", "F") else 1
+        )
+        if used + character_width > target:
+            break
+        result.append(character)
+        used += character_width
+    return "".join(result) + "…"
+
+
+def _ansi_foreground(color: ColorValue) -> str:
+    if color is None:
+        return "\033[39m"
+    if isinstance(color, int):
+        return f"\033[{color}m"
+    red, green, blue = color
+    return f"\033[38;2;{red};{green};{blue}m"
+
+
+def _style_text(
+    value: str,
+    palette: ThemePalette,
+    role: str,
+    *,
+    enabled: bool,
+    bold: bool = False,
+    dim: bool = False,
+) -> str:
+    if not enabled:
+        return value
+    color = getattr(palette, role)
+    attributes = ("\033[1m" if bold else "") + ("\033[2m" if dim else "")
+    return f"{_ansi_foreground(color)}{attributes}{value}{ANSI_RESET}"
+
+
+def _fit_segments(segments: Sequence[StyledSegment], maximum: int) -> List[StyledSegment]:
+    fitted: List[StyledSegment] = []
+    remaining = maximum
+    for segment in segments:
+        if remaining <= 0:
+            break
+        text = _truncate_display(segment.text, remaining)
+        fitted.append(dataclasses.replace(segment, text=text))
+        consumed = _display_width(text)
+        remaining -= consumed
+        if text != segment.text:
+            break
+    return fitted
+
+
+def _flat_line(
+    segments: Sequence[StyledSegment],
+    width: int,
+    palette: ThemePalette,
+    *,
+    color_enabled: bool,
+    indent: int = 2,
+) -> str:
+    fitted = _fit_segments(segments, max(0, width - indent))
+    content = "".join(
+        _style_text(
+            segment.text,
+            palette,
+            segment.role,
+            enabled=color_enabled,
+            bold=segment.bold,
+            dim=segment.dim,
+        )
+        for segment in fitted
+    )
+    return " " * indent + content
+
+
+def _flat_separator(
+    width: int,
+    palette: ThemePalette,
+    *,
+    color_enabled: bool,
+) -> str:
+    value = "  " + "─" * max(1, width - 4)
+    return _style_text(value, palette, "subtle", enabled=color_enabled, dim=True)
+
+
+def _action_row_width(actions: Sequence[ActionSpec]) -> int:
+    groups = [_display_width(f"{key} {label}") for key, label, _role in actions]
+    return sum(groups) + ACTION_GROUP_GAP * max(0, len(groups) - 1)
+
+
+def _balanced_action_rows(
+    actions: Sequence[ActionSpec],
+    available_width: int,
+) -> List[List[ActionSpec]]:
+    """Use the fewest rows, then choose the most balanced contiguous split."""
+
+    action_list = list(actions)
+    if not action_list:
+        return []
+    for row_count in range(1, len(action_list) + 1):
+        candidates: List[Tuple[Tuple[int, int, Tuple[int, ...]], List[List[ActionSpec]]]] = []
+        for breaks in itertools.combinations(range(1, len(action_list)), row_count - 1):
+            boundaries = (0,) + breaks + (len(action_list),)
+            rows = [
+                action_list[boundaries[index]:boundaries[index + 1]]
+                for index in range(row_count)
+            ]
+            widths = tuple(_action_row_width(row) for row in rows)
+            if all(width <= available_width for width in widths):
+                score = (max(widths), max(widths) - min(widths), widths)
+                candidates.append((score, rows))
+        if candidates:
+            return min(candidates, key=lambda candidate: candidate[0])[1]
+    return [[action] for action in action_list]
+
+
+def _action_segments(actions: Sequence[ActionSpec]) -> List[StyledSegment]:
+    segments: List[StyledSegment] = []
+    for index, (key, label, role) in enumerate(actions):
+        if index:
+            segments.append(StyledSegment(" " * ACTION_GROUP_GAP))
+        segments.extend(
+            [StyledSegment(key, role, bold=True), StyledSegment(f" {label}")]
+        )
+    return segments
+
+
+def _render_action_rows(
+    actions: Sequence[ActionSpec],
+    width: int,
+    palette: ThemePalette,
+    *,
+    color_enabled: bool,
+) -> List[str]:
+    return [
+        _flat_line(
+            _action_segments(row),
+            width,
+            palette,
+            color_enabled=color_enabled,
+        )
+        for row in _balanced_action_rows(actions, max(1, width - 2))
+    ]
+
+
+def _supports_action_footer(decorated: bool, columns: int) -> bool:
+    return decorated and columns >= MIN_ACTION_FOOTER_COLUMNS
+
+
+def _friendly_path(value: Any) -> str:
+    text = _safe_terminal_text(value)
+    home = os.fspath(Path.home())
+    if text == home:
+        return "~"
+    if text.startswith(home + os.sep):
+        return "~" + text[len(home):]
+    return text
+
+
+def _cleanup_status(inspection: BranchInspection) -> Tuple[str, str]:
+    if inspection.protected:
+        return "PROTECTED · deletion blocked", "danger"
+    if inspection.used_by_worktrees:
+        return "IN USE · deletion blocked", "warning"
+    if inspection.merged_into_default is True:
+        return f"MERGED · {inspection.default_ref or 'default'}", "positive"
+    if inspection.merged_into_default is False:
+        return f"UNMERGED · {inspection.default_ref or 'default'}", "warning"
+    return "MERGE STATUS UNKNOWN", "warning"
+
+
+def _plain_cleanup_dialog(
+    inspection: BranchInspection,
+    record: Mapping[str, Any],
+) -> List[str]:
+    lines = [
+        "Herdr branch cleanup review",
+        "",
+        f"Repository: {_safe_terminal_text(inspection.repo_root)}",
+        f"Removed worktree: {_safe_terminal_text(record.get('worktree_path', 'unknown'))}",
+        f"Branch: {_safe_terminal_text(inspection.branch)}",
+        f"Last commit: {_safe_terminal_text(inspection.last_commit or 'unknown')}",
+        f"Default branch ref: {_safe_terminal_text(inspection.default_ref or 'unknown')}",
+        f"Merged into default: {_yes_no_unknown(inspection.merged_into_default)}",
+        f"Upstream: {_safe_terminal_text(inspection.upstream or 'none')}",
+    ]
+    if inspection.ahead is not None and inspection.behind is not None:
+        lines.append(f"Upstream distance: ahead {inspection.ahead}, behind {inspection.behind}")
+    lines.append("Remote branches are never deleted by this plugin.")
+    if record.get("forced_worktree_removal"):
+        lines.append("Warning: the worktree itself was removed with --force.")
+    if inspection.protected:
+        lines.append("Deletion blocked: this is a protected/default branch.")
+    if inspection.used_by_worktrees:
+        lines.append("Deletion blocked: branch is used by another worktree:")
+        lines.extend(f"  {_safe_terminal_text(path)}" for path in inspection.used_by_worktrees)
+    return lines
+
+
+def render_cleanup_dialog(
+    inspection: BranchInspection,
+    record: Mapping[str, Any],
+    palette: ThemePalette,
+    *,
+    columns: int,
+    decorated: bool,
+    color_enabled: bool,
+) -> List[str]:
+    if not _supports_action_footer(decorated, columns):
+        return _plain_cleanup_dialog(inspection, record)
+
+    width = max(MIN_ACTION_FOOTER_COLUMNS, min(columns, 88))
+    status, status_role = _cleanup_status(inspection)
+    lines = [
+        "",
+        _flat_line(
+            [StyledSegment("✓ ", "positive", bold=True), StyledSegment("Worktree removed", "text", bold=True)],
+            width,
+            palette,
+            color_enabled=color_enabled,
+        ),
+        "",
+    ]
+
+    def detail(label: str, value: str, role: str = "text", bold: bool = False) -> None:
+        lines.append(
+            _flat_line(
+                [StyledSegment(f"{label:<13}", "muted"), StyledSegment(value, role, bold=bold)],
+                width,
+                palette,
+                color_enabled=color_enabled,
+            )
+        )
+
+    detail("Repository", _friendly_path(inspection.repo_root))
+    detail("Worktree", _friendly_path(record.get("worktree_path", "unknown")))
+    detail("Branch", _safe_terminal_text(inspection.branch), "branch", True)
+    detail("Status", status, status_role, True)
+    detail("Last commit", _safe_terminal_text(inspection.last_commit or "unknown"))
+    if inspection.upstream:
+        upstream = _safe_terminal_text(inspection.upstream)
+        if inspection.ahead is not None and inspection.behind is not None:
+            upstream += f" · ahead {inspection.ahead}, behind {inspection.behind}"
+        detail("Upstream", upstream)
+
+    lines.append("")
+    if record.get("forced_worktree_removal"):
+        lines.append(
+            _flat_line(
+                [StyledSegment("! Worktree removal was forced.", "peach", bold=True)],
+                width,
+                palette,
+                color_enabled=color_enabled,
+            )
+        )
+    if inspection.protected:
+        advice = StyledSegment("This protected/default branch cannot be deleted here.", "danger", bold=True)
+    elif inspection.used_by_worktrees:
+        advice = StyledSegment("This branch is still checked out in another worktree.", "warning", bold=True)
+    elif inspection.merged_into_default is True:
+        advice = StyledSegment("This local branch can be deleted safely.", "positive", bold=True)
+    elif inspection.merged_into_default is False:
+        advice = StyledSegment("Unmerged commits may be lost by force deletion.", "warning", bold=True)
+    else:
+        advice = StyledSegment("Review this branch before choosing deletion.", "warning", bold=True)
+    lines.append(_flat_line([advice], width, palette, color_enabled=color_enabled))
+    lines.append(
+        _flat_line(
+            [StyledSegment("Remote branches are never changed.", "subtle", dim=True)],
+            width,
+            palette,
+            color_enabled=color_enabled,
+        )
+    )
+    for path in inspection.used_by_worktrees:
+        lines.append(
+            _flat_line(
+                [StyledSegment("↳ ", "warning"), StyledSegment(_friendly_path(path), "muted")],
+                width,
+                palette,
+                color_enabled=color_enabled,
+            )
+        )
+
+    lines.extend(["", _flat_separator(width, palette, color_enabled=color_enabled)])
+    blocked = inspection.protected or bool(inspection.used_by_worktrees)
+    if blocked:
+        actions: List[ActionSpec] = [
+            ("ENTER", "Keep", "accent"),
+            ("S", "Later", "accent"),
+            ("Q", "Close", "accent"),
+        ]
+    else:
+        actions = [
+            ("ENTER", "Keep", "accent"),
+            ("D", "Delete safely", "positive"),
+            ("F", "Force…", "danger"),
+            ("S", "Later", "accent"),
+            ("Q", "Close", "accent"),
+        ]
+    lines.extend(_render_action_rows(actions, width, palette, color_enabled=color_enabled))
+    lines.append("")
+    return lines
+
+
+def render_force_delete_dialog(
+    inspection: BranchInspection,
+    palette: ThemePalette,
+    *,
+    columns: int,
+    decorated: bool,
+    color_enabled: bool,
+) -> List[str]:
+    if not decorated or columns < 48:
+        return [
+            "Force deletion can discard commits not merged into the default branch.",
+            f"Type '{inspection.branch}' to force-delete.",
+        ]
+    width = max(48, min(columns, 76))
+    return [
+        "",
+        _flat_line(
+            [StyledSegment("! Destructive action", "danger", bold=True)],
+            width,
+            palette,
+            color_enabled=color_enabled,
+        ),
+        _flat_line(
+            [StyledSegment("Commits not merged into the default branch can be lost.", "warning")],
+            width,
+            palette,
+            color_enabled=color_enabled,
+        ),
+        "",
+        _flat_line(
+            [StyledSegment("Type the exact branch name to continue:", "muted")],
+            width,
+            palette,
+            color_enabled=color_enabled,
+        ),
+        _flat_line(
+            [StyledSegment(inspection.branch, "branch", bold=True)],
+            width,
+            palette,
+            color_enabled=color_enabled,
+        ),
+        "",
+    ]
+
+
+def _read_utf8_character(file_descriptor: int) -> str:
+    first = os.read(file_descriptor, 1)
+    if not first:
+        raise EOFError
+    leading = first[0]
+    if leading < 0x80:
+        length = 1
+    elif leading & 0xE0 == 0xC0:
+        length = 2
+    elif leading & 0xF0 == 0xE0:
+        length = 3
+    elif leading & 0xF8 == 0xF0:
+        length = 4
+    else:
+        length = 1
+    data = first
+    while len(data) < length:
+        continuation = os.read(file_descriptor, length - len(data))
+        if not continuation:
+            break
+        data += continuation
+    return data.decode("utf-8", errors="replace")
+
+
+def read_single_key(
+    *,
+    input_fd: Optional[int] = None,
+    output_stream: Optional[Any] = None,
+) -> str:
+    """Read one key without echo, restoring terminal state on every exit path."""
+
+    file_descriptor = sys.stdin.fileno() if input_fd is None else input_fd
+    stream = sys.stdout if output_stream is None else output_stream
+    old_attributes = termios.tcgetattr(file_descriptor)
+    new_attributes = list(old_attributes)
+    new_attributes[6] = list(old_attributes[6])
+    new_attributes[3] &= ~(termios.ICANON | termios.ECHO)
+    new_attributes[6][termios.VMIN] = 1
+    new_attributes[6][termios.VTIME] = 0
+    stream.write("\033[?25l")
+    stream.flush()
+    try:
+        termios.tcsetattr(file_descriptor, termios.TCSADRAIN, new_attributes)
+        character = _read_utf8_character(file_descriptor)
+        if character == "\x03":
+            raise KeyboardInterrupt
+        if character == "\x1b":
+            while select.select([file_descriptor], [], [], 0.01)[0]:
+                os.read(file_descriptor, 1)
+            return "q"
+        if character in ("\r", "\n"):
+            return ""
+        return character
+    finally:
+        try:
+            termios.tcsetattr(file_descriptor, termios.TCSADRAIN, old_attributes)
+        finally:
+            stream.write("\033[?25h")
+            stream.flush()
+
+
+def normalize_cleanup_choice(value: str) -> str:
+    choice = value.strip().casefold()
+    # These jamo are produced by the same physical keys with a Korean layout.
+    return {"ㅇ": "d", "ㄹ": "f", "ㄴ": "s", "ㅂ": "q", "ㅏ": "k"}.get(choice, choice)
+
+
+def review_pending_cleanups(
+    state_dir: Path,
+    *,
+    cleanup_id: Optional[str] = None,
+    input_fn: Callable[[str], str] = input,
+    output_fn: Callable[[str], None] = print,
+    env: Optional[Mapping[str, str]] = None,
+) -> int:
+    effective_env = os.environ if env is None else env
+    decorated = output_fn is print and sys.stdout.isatty()
+    color_enabled = (
+        decorated
+        and "NO_COLOR" not in effective_env
+        and effective_env.get("TERM", "") != "dumb"
+    )
+    theme_settings = load_theme_settings(effective_env)
+    appearance = query_terminal_appearance() if decorated and theme_settings.auto_switch else None
+    palette = resolve_theme_palette(theme_settings, appearance=appearance)
+    columns = shutil.get_terminal_size((80, 24)).columns
+    records = list_pending_cleanups(state_dir)
+    if cleanup_id:
+        records = [record for record in records if record.get("id") == cleanup_id]
+    if not records:
+        output_fn("No pending branch cleanups.")
+        return 0
+
+    for record in records:
+        repo_value = record.get("repo_root")
+        branch_value = record.get("branch")
+        if not isinstance(repo_value, str) or not isinstance(branch_value, str):
+            output_fn("Skipping an invalid pending branch cleanup record.")
+            continue
+        try:
+            inspection = inspect_branch(Path(repo_value), branch_value)
+        except BootstrapError as exc:
+            output_fn(
+                f"Cannot inspect {_safe_terminal_text(branch_value)}: "
+                f"{_safe_terminal_text(exc)}"
+            )
+            output_fn("The request remains pending for later review.")
+            continue
+
+        def display_cleanup(*notices: str) -> None:
+            _clear_screen()
+            for line in render_cleanup_dialog(
+                inspection,
+                record,
+                palette,
+                columns=columns,
+                decorated=decorated,
+                color_enabled=color_enabled,
+            ):
+                output_fn(line)
+            for notice in notices:
+                output_fn(notice)
+
+        display_cleanup()
+
+        if not inspection.exists:
+            output_fn("The local branch no longer exists; marking this request resolved.")
+            _resolve_pending_cleanup(state_dir, record, "already_absent")
+            continue
+
+        action_footer_visible = _supports_action_footer(decorated, columns)
+        single_key_mode = action_footer_visible and input_fn is input and sys.stdin.isatty()
+        while True:
+            if inspection.protected or inspection.used_by_worktrees:
+                prompt = "[K]eep branch (default)  [S]kip for later  [Q]uit: "
+            else:
+                prompt = "[K]eep (default)  [D]elete safely  [F]orce delete...  [S]kip  [Q]uit: "
+            if action_footer_visible and not single_key_mode:
+                prompt = _style_text(
+                    "Select › ",
+                    palette,
+                    "accent",
+                    enabled=color_enabled,
+                    bold=True,
+                )
+            try:
+                if single_key_mode:
+                    try:
+                        choice = normalize_cleanup_choice(read_single_key())
+                    except (OSError, ValueError, AttributeError):
+                        single_key_mode = False
+                        choice = normalize_cleanup_choice(input_fn(prompt))
+                else:
+                    choice = normalize_cleanup_choice(input_fn(prompt))
+            except EOFError:
+                output_fn("No interactive input; request remains pending.")
+                return 0
+            if choice in ("", "k", "keep"):
+                _resolve_pending_cleanup(state_dir, record, "kept")
+                output_fn(f"Kept local branch {inspection.branch}.")
+                break
+            if choice in ("s", "skip"):
+                output_fn("Request left pending for later review.")
+                break
+            if choice in ("q", "quit"):
+                return 0
+            if choice in ("d", "delete") and not inspection.protected and not inspection.used_by_worktrees:
+                try:
+                    delete_local_branch(
+                        inspection.repo_root,
+                        inspection.branch,
+                        force=False,
+                        expected_oid=inspection.head_oid,
+                    )
+                except BootstrapError as exc:
+                    _record_cleanup_result(state_dir, record, "safe_delete_failed", error=str(exc))
+                    inspection = inspect_branch(inspection.repo_root, inspection.branch)
+                    display_cleanup(
+                        f"Safe deletion refused: {_safe_terminal_text(exc)}",
+                        "The request remains pending. Use force only after reviewing unmerged commits.",
+                    )
+                    continue
+                _resolve_pending_cleanup(state_dir, record, "deleted_safely")
+                output_fn(f"Deleted local branch {inspection.branch} safely.")
+                break
+            if choice in ("f", "force") and not inspection.protected and not inspection.used_by_worktrees:
+                _clear_screen()
+                for line in render_force_delete_dialog(
+                    inspection,
+                    palette,
+                    columns=columns,
+                    decorated=decorated,
+                    color_enabled=color_enabled,
+                ):
+                    output_fn(line)
+                confirmation_prompt = f"Type '{inspection.branch}' to force-delete: "
+                if decorated:
+                    confirmation_prompt = _style_text(
+                        "Branch name › ",
+                        palette,
+                        "danger",
+                        enabled=color_enabled,
+                        bold=True,
+                    )
+                try:
+                    confirmation = input_fn(confirmation_prompt).strip()
+                except EOFError:
+                    output_fn("No confirmation; request remains pending.")
+                    return 0
+                if confirmation != inspection.branch:
+                    display_cleanup("Branch name did not match; nothing was deleted.")
+                    continue
+                try:
+                    delete_local_branch(
+                        inspection.repo_root,
+                        inspection.branch,
+                        force=True,
+                        expected_oid=inspection.head_oid,
+                    )
+                except BootstrapError as exc:
+                    _record_cleanup_result(state_dir, record, "force_delete_failed", error=str(exc))
+                    inspection = inspect_branch(inspection.repo_root, inspection.branch)
+                    display_cleanup(f"Force deletion failed: {_safe_terminal_text(exc)}")
+                    continue
+                _resolve_pending_cleanup(state_dir, record, "deleted_forcibly")
+                output_fn(f"Force-deleted local branch {inspection.branch}.")
+                break
+            if single_key_mode:
+                sys.stdout.write("\a")
+                sys.stdout.flush()
+            else:
+                output_fn("Unknown or unavailable choice.")
+    return 0
+
+
+def _herdr_command(env: Mapping[str, str]) -> Optional[str]:
+    configured = env.get("HERDR_BIN_PATH")
+    if configured:
+        return configured
+    return shutil.which("herdr")
+
+
+def launch_branch_cleanup_popup(
+    cleanup_id: str,
+    branch: str,
+    env: Mapping[str, str],
+) -> bool:
+    herdr = _herdr_command(env)
+    if not herdr:
+        return False
+    command = [
+        herdr,
+        "plugin",
+        "pane",
+        "open",
+        "--plugin",
+        PLUGIN_ID,
+        "--entrypoint",
+        "branch-cleanup",
+        "--placement",
+        "popup",
+        "--width",
+        "68%",
+        "--height",
+        "50%",
+        "--focus",
+        "--env",
+        f"HERDR_BRANCH_CLEANUP_ID={cleanup_id}",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if result.returncode == 0:
+        return True
+    with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+        subprocess.run(
+            [
+                herdr,
+                "notification",
+                "show",
+                "Branch cleanup pending",
+                "--body",
+                f"Review local branch {branch} from the Worktree Bootstrap action.",
+                "--sound",
+                "request",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=5,
+        )
+    return False
+
+
+def handle_branch_cleanup_event(
+    env: Mapping[str, str],
+    state_dir: Path,
+    *,
+    open_popup: bool = True,
+) -> Mapping[str, Any]:
+    pending = queue_branch_cleanup(env, state_dir)
+    popup_opened = False
+    if open_popup:
+        popup_opened = launch_branch_cleanup_popup(str(pending["id"]), str(pending["branch"]), env)
+    result = dict(pending)
+    result["popup_opened"] = popup_opened
+    print(
+        f"queued branch cleanup for {pending['branch']}; "
+        f"popup={'opened' if popup_opened else 'pending'}",
+        flush=True,
+    )
+    return result
+
+
 def target_key(context: RepositoryContext) -> str:
     value = f"{context.common_git_dir}\0{context.target}".encode("utf-8", "surrogateescape")
     return hashlib.sha256(value).hexdigest()[:24]
@@ -771,6 +2314,12 @@ def status_lines(context: RepositoryContext, state_dir: Path) -> Tuple[List[str]
         if last.get("error"):
             summary += f", error={last['error']}"
         lines.append(f"Last run: {summary}")
+    pending_count = 0
+    for pending in list_pending_cleanups(state_dir):
+        repo_value = pending.get("repo_root")
+        if isinstance(repo_value, str) and _canonical(Path(repo_value)) == context.source:
+            pending_count += 1
+    lines.append(f"Pending branch cleanups: {pending_count}")
     return lines, invalid
 
 
@@ -934,7 +2483,18 @@ def manage(context: RepositoryContext, state_dir: Path) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Bootstrap Herdr Git worktrees")
-    parser.add_argument("action", choices=("bootstrap", "sync", "setup", "status", "manage"))
+    parser.add_argument(
+        "action",
+        choices=(
+            "bootstrap",
+            "sync",
+            "setup",
+            "status",
+            "manage",
+            "branch-cleanup-event",
+            "branch-cleanup",
+        ),
+    )
     parser.add_argument("--target", help="explicit target checkout (primarily for testing/manual use)")
     parser.add_argument("--state-dir", help="override plugin state directory")
     return parser
@@ -945,6 +2505,12 @@ def main(argv: Optional[Sequence[str]] = None, env: Optional[Mapping[str, str]] 
     effective_env = os.environ if env is None else env
     state_dir = Path(args.state_dir).expanduser() if args.state_dir else default_state_dir(effective_env)
     try:
+        if args.action == "branch-cleanup-event":
+            handle_branch_cleanup_event(effective_env, state_dir)
+            return 0
+        if args.action == "branch-cleanup":
+            cleanup_id = effective_env.get("HERDR_BRANCH_CLEANUP_ID")
+            return review_pending_cleanups(state_dir, cleanup_id=cleanup_id, env=effective_env)
         target_path = resolve_target_path(args.target, effective_env)
         context = resolve_repository(target_path)
         if args.action == "status":
@@ -953,6 +2519,8 @@ def main(argv: Optional[Sequence[str]] = None, env: Optional[Mapping[str, str]] 
             return 2 if invalid else 0
         if args.action == "manage":
             return manage(context, state_dir)
+        if args.action == "bootstrap":
+            record_worktree_mapping(context, state_dir)
         execute_action(args.action, context, state_dir)
         return 0
     except NothingToDo as exc:

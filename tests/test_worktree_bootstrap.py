@@ -168,6 +168,24 @@ class RepositoryResolutionTests(GitRepositoryTestCase):
         with self.assertRaises(plugin.NothingToDo):
             plugin.execute_action("bootstrap", self.context, self.state_dir)
 
+    def test_bootstrap_entrypoint_caches_worktree_even_without_configuration(self):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            result = plugin.main(
+                [
+                    "bootstrap",
+                    "--target",
+                    os.fspath(self.target),
+                    "--state-dir",
+                    os.fspath(self.state_dir),
+                ],
+                env={},
+            )
+        self.assertEqual(result, 0)
+        mapping = plugin.load_worktree_mapping(self.state_dir, self.target)
+        self.assertEqual(mapping["branch"], "feature")
+        self.assertEqual(Path(mapping["repo_root"]), self.source.resolve())
+
 
 class CopyBehaviorTests(GitRepositoryTestCase):
     def test_copies_files_directories_modes_spaces_unicode_and_is_idempotent(self):
@@ -411,6 +429,201 @@ class StateAndManagementTests(GitRepositoryTestCase):
                 self.assertEqual(plugin.manage(self.context, self.state_dir), 0)
         exclude = self.context.common_git_dir / "info" / "exclude"
         self.assertIn("/.herdr/worktree-setup.json", exclude.read_text(encoding="utf-8"))
+
+
+class BranchCleanupTests(GitRepositoryTestCase):
+    def removed_event(self, *, workspace=True, branch="feature", detached=False, forced=False):
+        workspace_value = None
+        if workspace:
+            workspace_value = {
+                "workspace_id": "w2",
+                "worktree": {
+                    "repo_root": os.fspath(self.source.resolve()),
+                    "repo_key": os.fspath((self.source / ".git").resolve()),
+                    "repo_name": self.source.name,
+                    "checkout_path": os.fspath(self.target.resolve()),
+                    "is_linked_worktree": True,
+                },
+            }
+        return {
+            "HERDR_PLUGIN_EVENT": "worktree.removed",
+            "HERDR_PLUGIN_EVENT_JSON": json.dumps(
+                {
+                    "event": "worktree.removed",
+                    "data": {
+                        "type": "worktree_removed",
+                        "workspace_id": "w2",
+                        "workspace": workspace_value,
+                        "worktree": {
+                            "path": os.fspath(self.target.resolve()),
+                            "branch": branch,
+                            "is_bare": False,
+                            "is_detached": detached,
+                            "is_prunable": False,
+                            "is_linked_worktree": True,
+                            "label": branch,
+                        },
+                        "forced": forced,
+                    },
+                }
+            ),
+        }
+
+    def record_and_remove_target(self):
+        plugin.record_worktree_mapping(self.context, self.state_dir)
+        run(["git", "worktree", "remove", os.fspath(self.target)], cwd=self.source)
+
+    def branch_exists(self, branch):
+        result = run(
+            ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+            cwd=self.source,
+            check=False,
+        )
+        return result.returncode == 0
+
+    def test_removed_event_queues_and_safely_deletes_merged_branch(self):
+        self.record_and_remove_target()
+        pending = plugin.handle_branch_cleanup_event(
+            self.removed_event(), self.state_dir, open_popup=False
+        )
+        self.assertEqual(pending["branch"], "feature")
+        self.assertFalse(pending["popup_opened"])
+        inspection = plugin.inspect_branch(self.source, "feature")
+        self.assertTrue(inspection.exists)
+        self.assertTrue(inspection.merged_into_default)
+        output = []
+        result = plugin.review_pending_cleanups(
+            self.state_dir,
+            input_fn=lambda prompt: "d",
+            output_fn=output.append,
+        )
+        self.assertEqual(result, 0)
+        self.assertFalse(self.branch_exists("feature"))
+        self.assertEqual(plugin.list_pending_cleanups(self.state_dir), [])
+
+    def test_keep_is_default_and_resolves_pending_without_deletion(self):
+        self.record_and_remove_target()
+        plugin.handle_branch_cleanup_event(self.removed_event(), self.state_dir, open_popup=False)
+        plugin.review_pending_cleanups(
+            self.state_dir,
+            input_fn=lambda prompt: "",
+            output_fn=lambda line: None,
+        )
+        self.assertTrue(self.branch_exists("feature"))
+        self.assertEqual(plugin.list_pending_cleanups(self.state_dir), [])
+        last = plugin._read_json_file(
+            self.state_dir / plugin.BRANCH_CLEANUP_DIR / "last-result.json"
+        )
+        self.assertEqual(last["outcome"], "kept")
+
+    def test_unmerged_branch_safe_delete_is_refused_and_force_requires_exact_name(self):
+        (self.target / "feature-only").write_text("unmerged", encoding="utf-8")
+        run(["git", "add", "feature-only"], cwd=self.target)
+        run(["git", "commit", "-qm", "feature only"], cwd=self.target)
+        self.record_and_remove_target()
+        plugin.handle_branch_cleanup_event(self.removed_event(), self.state_dir, open_popup=False)
+        answers = iter(["d", "f", "wrong", "f", "feature"])
+        output = []
+        plugin.review_pending_cleanups(
+            self.state_dir,
+            input_fn=lambda prompt: next(answers),
+            output_fn=output.append,
+        )
+        self.assertFalse(self.branch_exists("feature"))
+        self.assertTrue(any("Safe deletion refused" in line for line in output))
+        self.assertTrue(any("did not match" in line for line in output))
+        last = plugin._read_json_file(
+            self.state_dir / plugin.BRANCH_CLEANUP_DIR / "last-result.json"
+        )
+        self.assertEqual(last["outcome"], "deleted_forcibly")
+
+    def test_protected_branch_cannot_be_deleted(self):
+        primary_branch = run(["git", "branch", "--show-current"], cwd=self.source).stdout.strip()
+        pending_id = plugin.pending_cleanup_id(self.source, self.target, primary_branch)
+        plugin._atomic_write_json(
+            plugin.pending_cleanup_path(self.state_dir, pending_id),
+            {
+                "version": 1,
+                "id": pending_id,
+                "created_at": "2026-07-31T00:00:00+00:00",
+                "repo_root": os.fspath(self.source.resolve()),
+                "worktree_path": os.fspath(self.target.resolve()),
+                "branch": primary_branch,
+                "forced_worktree_removal": False,
+                "status": "pending",
+            },
+        )
+        output = []
+        plugin.review_pending_cleanups(
+            self.state_dir,
+            input_fn=lambda prompt: "k",
+            output_fn=output.append,
+        )
+        self.assertTrue(self.branch_exists(primary_branch))
+        self.assertTrue(any("Deletion blocked" in line for line in output))
+        with self.assertRaisesRegex(plugin.BootstrapError, "protected"):
+            plugin.delete_local_branch(self.source, primary_branch, force=True)
+
+    def test_branch_used_by_another_worktree_is_blocked(self):
+        self.record_and_remove_target()
+        other = self.root / "other feature checkout"
+        run(["git", "worktree", "add", os.fspath(other), "feature"], cwd=self.source)
+        plugin.handle_branch_cleanup_event(self.removed_event(), self.state_dir, open_popup=False)
+        inspection = plugin.inspect_branch(self.source, "feature")
+        self.assertIn(os.fspath(other.resolve()), inspection.used_by_worktrees)
+        with self.assertRaisesRegex(plugin.BootstrapError, "another worktree"):
+            plugin.delete_local_branch(self.source, "feature")
+
+    def test_branch_change_after_review_is_blocked(self):
+        self.record_and_remove_target()
+        inspection = plugin.inspect_branch(self.source, "feature")
+        with self.assertRaisesRegex(plugin.BootstrapError, "changed after it was displayed"):
+            plugin.delete_local_branch(
+                self.source,
+                "feature",
+                expected_oid="0" * 40,
+            )
+        self.assertTrue(self.branch_exists("feature"))
+
+    def test_workspace_null_uses_cached_primary_checkout(self):
+        self.record_and_remove_target()
+        pending = plugin.queue_branch_cleanup(
+            self.removed_event(workspace=False), self.state_dir
+        )
+        self.assertEqual(Path(pending["repo_root"]), self.source.resolve())
+
+    def test_detached_removed_worktree_is_a_noop(self):
+        plugin.record_worktree_mapping(self.context, self.state_dir)
+        mapping_path = plugin.worktree_map_path(self.state_dir, self.target)
+        self.assertTrue(mapping_path.exists())
+        with self.assertRaises(plugin.NothingToDo):
+            plugin.queue_branch_cleanup(
+                self.removed_event(branch=None, detached=True), self.state_dir
+            )
+        self.assertEqual(plugin.list_pending_cleanups(self.state_dir), [])
+        self.assertFalse(mapping_path.exists())
+
+    def test_popup_launch_passes_only_cleanup_id(self):
+        completed = subprocess.CompletedProcess([], 0, stdout="{}", stderr="")
+        with mock.patch.object(plugin.subprocess, "run", return_value=completed) as run_mock:
+            opened = plugin.launch_branch_cleanup_popup(
+                "a" * 24,
+                "feature",
+                {"HERDR_BIN_PATH": "/usr/local/bin/herdr"},
+            )
+        self.assertTrue(opened)
+        command = run_mock.call_args.args[0]
+        self.assertIn("HERDR_BRANCH_CLEANUP_ID=" + "a" * 24, command)
+        self.assertNotIn("feature", command)
+
+    def test_event_keeps_pending_when_popup_cannot_open(self):
+        self.record_and_remove_target()
+        with mock.patch.object(plugin, "launch_branch_cleanup_popup", return_value=False):
+            result = plugin.handle_branch_cleanup_event(
+                self.removed_event(), self.state_dir, open_popup=True
+            )
+        self.assertFalse(result["popup_opened"])
+        self.assertEqual(len(plugin.list_pending_cleanups(self.state_dir)), 1)
 
 
 if __name__ == "__main__":

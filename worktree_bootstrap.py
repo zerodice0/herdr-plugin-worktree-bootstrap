@@ -23,7 +23,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import uuid
 
 
@@ -31,6 +31,9 @@ PLUGIN_ID = "zerodice0.worktree-bootstrap"
 COPY_LIST = Path(".herdr/worktree-copy.list")
 SETUP_FILE = Path(".herdr/worktree-setup.json")
 TXN_PREFIX = ".herdr-worktree-bootstrap-txn-"
+BRANCH_CLEANUP_DIR = "branch-cleanup"
+WORKTREE_MAP_DIR = "worktree-map"
+PROTECTED_BRANCHES = frozenset({"main", "master", "develop", "development", "trunk"})
 
 
 class BootstrapError(RuntimeError):
@@ -92,6 +95,23 @@ class SetupCommand:
     timeout_seconds: int
 
 
+@dataclasses.dataclass(frozen=True)
+class BranchInspection:
+    repo_root: Path
+    branch: str
+    exists: bool
+    protected: bool
+    protection_reason: Optional[str]
+    used_by_worktrees: Tuple[str, ...]
+    default_ref: Optional[str]
+    merged_into_default: Optional[bool]
+    upstream: Optional[str]
+    ahead: Optional[int]
+    behind: Optional[int]
+    last_commit: Optional[str]
+    head_oid: Optional[str]
+
+
 def _run_git(
     cwd: Path,
     args: Sequence[str],
@@ -138,15 +158,28 @@ def _is_bare(path: Path) -> bool:
     return result.stdout.strip() == "true"
 
 
+def parse_worktree_records(raw: bytes) -> List[Mapping[str, Any]]:
+    """Parse `git worktree list --porcelain -z` without path quoting."""
+
+    records: List[Mapping[str, Any]] = []
+    current: Dict[str, Any] = {}
+    for field in raw.split(b"\0"):
+        if not field:
+            if current:
+                records.append(current)
+                current = {}
+            continue
+        key, separator, value = field.partition(b" ")
+        current[os.fsdecode(key)] = os.fsdecode(value) if separator else True
+    if current:
+        records.append(current)
+    return records
+
+
 def parse_worktree_porcelain(raw: bytes) -> List[Path]:
     """Extract worktree paths from `git worktree list --porcelain -z`."""
 
-    paths: List[Path] = []
-    for field in raw.split(b"\0"):
-        if field.startswith(b"worktree "):
-            value = field[len(b"worktree ") :]
-            paths.append(Path(os.fsdecode(value)))
-    return paths
+    return [Path(record["worktree"]) for record in parse_worktree_records(raw) if "worktree" in record]
 
 
 def find_primary_checkout(target: Path, common_git_dir: Path) -> Optional[Path]:
@@ -586,6 +619,585 @@ def default_state_dir(env: Mapping[str, str]) -> Path:
     return Path.home() / ".local" / "state" / "herdr" / "plugins" / PLUGIN_ID
 
 
+def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=os.fspath(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(dict(payload), handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary)
+
+
+def _read_json_file(path: Path) -> Optional[Mapping[str, Any]]:
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return document if isinstance(document, dict) else None
+
+
+def _path_state_key(path: Path) -> str:
+    encoded = os.fspath(_canonical(path)).encode("utf-8", "surrogateescape")
+    return hashlib.sha256(encoded).hexdigest()[:24]
+
+
+def worktree_map_path(state_dir: Path, target: Path) -> Path:
+    return state_dir / WORKTREE_MAP_DIR / f"{_path_state_key(target)}.json"
+
+
+def record_worktree_mapping(context: RepositoryContext, state_dir: Path) -> None:
+    if context.target_is_primary:
+        return
+    branch_result = _run_git(
+        context.target,
+        ["symbolic-ref", "--quiet", "--short", "HEAD"],
+        check=False,
+    )
+    branch = branch_result.stdout.strip() if branch_result.returncode == 0 else None
+    payload: Dict[str, Any] = {
+        "version": 1,
+        "target": os.fspath(context.target),
+        "repo_root": os.fspath(context.source),
+        "common_git_dir": os.fspath(context.common_git_dir),
+        "branch": branch or None,
+        "recorded_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+    _atomic_write_json(worktree_map_path(state_dir, context.target), payload)
+
+
+def load_worktree_mapping(state_dir: Path, target: Path) -> Optional[Mapping[str, Any]]:
+    return _read_json_file(worktree_map_path(state_dir, target))
+
+
+def _pending_cleanup_dir(state_dir: Path) -> Path:
+    return state_dir / BRANCH_CLEANUP_DIR / "pending"
+
+
+def pending_cleanup_id(repo_root: Path, worktree_path: Path, branch: str) -> str:
+    raw = f"{_canonical(repo_root)}\0{_canonical(worktree_path)}\0{branch}".encode(
+        "utf-8", "surrogateescape"
+    )
+    return hashlib.sha256(raw).hexdigest()[:24]
+
+
+def pending_cleanup_path(state_dir: Path, cleanup_id: str) -> Path:
+    if not cleanup_id or any(character not in "0123456789abcdef" for character in cleanup_id):
+        raise BootstrapError("invalid branch cleanup id")
+    return _pending_cleanup_dir(state_dir) / f"{cleanup_id}.json"
+
+
+def list_pending_cleanups(state_dir: Path) -> List[Mapping[str, Any]]:
+    directory = _pending_cleanup_dir(state_dir)
+    if not directory.exists():
+        return []
+    records: List[Mapping[str, Any]] = []
+    for path in sorted(directory.glob("*.json")):
+        document = _read_json_file(path)
+        if document is None:
+            continue
+        record = dict(document)
+        record["_path"] = os.fspath(path)
+        records.append(record)
+    return sorted(records, key=lambda item: str(item.get("created_at", "")))
+
+
+def _normalize_local_branch(branch: str) -> str:
+    value = branch.strip()
+    prefix = "refs/heads/"
+    if value.startswith(prefix):
+        value = value[len(prefix) :]
+    if not value or "\x00" in value:
+        raise BootstrapError("removed worktree did not provide a valid local branch")
+    return value
+
+
+def _removed_event_details(env: Mapping[str, str]) -> Tuple[Path, Optional[Path], str, bool]:
+    envelope = _decode_json_env(env, "HERDR_PLUGIN_EVENT_JSON")
+    if envelope is None:
+        raise BootstrapError("HERDR_PLUGIN_EVENT_JSON is required for branch cleanup")
+    event_name = env.get("HERDR_PLUGIN_EVENT") or envelope.get("event")
+    if event_name != "worktree.removed":
+        raise NothingToDo("event is not worktree.removed; nothing was queued")
+    data = envelope.get("data")
+    if not isinstance(data, dict):
+        raise BootstrapError("worktree.removed event data is missing")
+    worktree = data.get("worktree")
+    if not isinstance(worktree, dict):
+        raise BootstrapError("worktree.removed event has no worktree record")
+    raw_path = worktree.get("path")
+    if not isinstance(raw_path, str) or not raw_path:
+        raise BootstrapError("worktree.removed event has no worktree path")
+    raw_branch = worktree.get("branch")
+    if raw_branch is None or worktree.get("is_detached") is True:
+        raise NothingToDo("removed worktree was detached; no local branch cleanup is needed")
+    if not isinstance(raw_branch, str):
+        raise BootstrapError("worktree.removed branch must be a string")
+    branch = _normalize_local_branch(raw_branch)
+    repo_root: Optional[Path] = None
+    workspace = data.get("workspace")
+    if isinstance(workspace, dict):
+        provenance = workspace.get("worktree")
+        if isinstance(provenance, dict) and isinstance(provenance.get("repo_root"), str):
+            repo_root = _canonical(Path(provenance["repo_root"]))
+    return _canonical(Path(raw_path)), repo_root, branch, bool(data.get("forced", False))
+
+
+def _validate_cleanup_repository(repo_root: Path, expected_common: Optional[str] = None) -> Path:
+    if not repo_root.exists():
+        raise BootstrapError(f"branch cleanup repository is unavailable: {repo_root}")
+    if _is_bare(repo_root):
+        raise BootstrapError("branch cleanup requires a non-bare primary checkout")
+    resolved = _git_root(repo_root)
+    common = _git_common_dir(resolved)
+    if expected_common and common != _canonical(Path(expected_common)):
+        raise BootstrapError("cached worktree and cleanup repository no longer share a Git directory")
+    return resolved
+
+
+def queue_branch_cleanup(env: Mapping[str, str], state_dir: Path) -> Mapping[str, Any]:
+    try:
+        worktree_path, event_repo_root, branch, forced = _removed_event_details(env)
+    except NothingToDo:
+        envelope = _decode_json_env(env, "HERDR_PLUGIN_EVENT_JSON")
+        data = envelope.get("data") if isinstance(envelope, dict) else None
+        worktree = data.get("worktree") if isinstance(data, dict) else None
+        raw_path = worktree.get("path") if isinstance(worktree, dict) else None
+        if isinstance(raw_path, str) and raw_path:
+            with contextlib.suppress(OSError):
+                worktree_map_path(state_dir, Path(raw_path)).unlink()
+        raise
+    mapping = load_worktree_mapping(state_dir, worktree_path)
+    cached_repo = mapping.get("repo_root") if isinstance(mapping, dict) else None
+    repo_candidate = event_repo_root
+    if repo_candidate is None and isinstance(cached_repo, str):
+        repo_candidate = Path(cached_repo)
+    if repo_candidate is None:
+        raise BootstrapError("cannot identify the primary checkout for removed worktree")
+    expected_common = mapping.get("common_git_dir") if isinstance(mapping, dict) else None
+    repo_root = _validate_cleanup_repository(
+        _canonical(repo_candidate),
+        expected_common if isinstance(expected_common, str) else None,
+    )
+    branch_check = _run_git(repo_root, ["check-ref-format", "--branch", branch], check=False)
+    if branch_check.returncode != 0:
+        raise BootstrapError("removed worktree reported an invalid branch name")
+    cleanup_id = pending_cleanup_id(repo_root, worktree_path, branch)
+    payload: Dict[str, Any] = {
+        "version": 1,
+        "id": cleanup_id,
+        "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "repo_root": os.fspath(repo_root),
+        "worktree_path": os.fspath(worktree_path),
+        "branch": branch,
+        "forced_worktree_removal": forced,
+        "status": "pending",
+    }
+    _atomic_write_json(pending_cleanup_path(state_dir, cleanup_id), payload)
+    with contextlib.suppress(OSError):
+        worktree_map_path(state_dir, worktree_path).unlink()
+    return payload
+
+
+def _ref_exists(repo_root: Path, ref: str) -> bool:
+    result = _run_git(repo_root, ["show-ref", "--verify", "--quiet", ref], check=False)
+    if result.returncode not in (0, 1):
+        raise BootstrapError(f"could not inspect Git ref: {ref}")
+    return result.returncode == 0
+
+
+def _default_branch_ref(repo_root: Path) -> Optional[str]:
+    symbolic = _run_git(
+        repo_root,
+        ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+        check=False,
+    )
+    if symbolic.returncode == 0 and symbolic.stdout.strip():
+        return symbolic.stdout.strip()
+    for candidate in ("main", "master", "trunk", "develop", "development"):
+        if _ref_exists(repo_root, f"refs/heads/{candidate}"):
+            return candidate
+    return None
+
+
+def inspect_branch(repo_root: Path, branch: str) -> BranchInspection:
+    repo_root = _validate_cleanup_repository(_canonical(repo_root))
+    branch = _normalize_local_branch(branch)
+    if _run_git(repo_root, ["check-ref-format", "--branch", branch], check=False).returncode != 0:
+        raise BootstrapError("invalid local branch name")
+    exists = _ref_exists(repo_root, f"refs/heads/{branch}")
+    default_ref = _default_branch_ref(repo_root)
+    default_name = default_ref.split("/", 1)[-1] if default_ref else None
+    protected = branch in PROTECTED_BRANCHES or branch == default_name
+    protection_reason = "protected/default branch" if protected else None
+
+    used_by: List[str] = []
+    records_result = _run_git(repo_root, ["worktree", "list", "--porcelain", "-z"], text=False)
+    for record in parse_worktree_records(records_result.stdout):
+        if record.get("branch") == f"refs/heads/{branch}" and isinstance(record.get("worktree"), str):
+            used_by.append(str(record["worktree"]))
+
+    upstream: Optional[str] = None
+    ahead: Optional[int] = None
+    behind: Optional[int] = None
+    last_commit: Optional[str] = None
+    head_oid: Optional[str] = None
+    merged: Optional[bool] = None
+    if exists:
+        oid_result = _run_git(
+            repo_root,
+            ["rev-parse", "--verify", f"refs/heads/{branch}"],
+            check=False,
+        )
+        if oid_result.returncode == 0 and oid_result.stdout.strip():
+            head_oid = oid_result.stdout.strip()
+        upstream_result = _run_git(
+            repo_root,
+            ["for-each-ref", "--format=%(upstream:short)", f"refs/heads/{branch}"],
+            check=False,
+        )
+        if upstream_result.returncode == 0 and upstream_result.stdout.strip():
+            upstream = upstream_result.stdout.strip()
+            counts = _run_git(
+                repo_root,
+                ["rev-list", "--left-right", "--count", f"{branch}...{upstream}"],
+                check=False,
+            )
+            if counts.returncode == 0:
+                parts = counts.stdout.split()
+                if len(parts) == 2 and all(part.isdigit() for part in parts):
+                    ahead, behind = int(parts[0]), int(parts[1])
+        if default_ref and _ref_exists(
+            repo_root,
+            default_ref if default_ref.startswith("refs/") else (
+                f"refs/remotes/{default_ref}" if "/" in default_ref else f"refs/heads/{default_ref}"
+            ),
+        ):
+            merged_result = _run_git(
+                repo_root,
+                ["merge-base", "--is-ancestor", branch, default_ref],
+                check=False,
+            )
+            if merged_result.returncode in (0, 1):
+                merged = merged_result.returncode == 0
+        commit_result = _run_git(
+            repo_root,
+            ["log", "-1", "--format=%h %s", f"refs/heads/{branch}"],
+            check=False,
+        )
+        if commit_result.returncode == 0 and commit_result.stdout.strip():
+            last_commit = commit_result.stdout.strip()
+
+    return BranchInspection(
+        repo_root=repo_root,
+        branch=branch,
+        exists=exists,
+        protected=protected,
+        protection_reason=protection_reason,
+        used_by_worktrees=tuple(used_by),
+        default_ref=default_ref,
+        merged_into_default=merged,
+        upstream=upstream,
+        ahead=ahead,
+        behind=behind,
+        last_commit=last_commit,
+        head_oid=head_oid,
+    )
+
+
+def delete_local_branch(
+    repo_root: Path,
+    branch: str,
+    *,
+    force: bool = False,
+    expected_oid: Optional[str] = None,
+) -> None:
+    inspection = inspect_branch(repo_root, branch)
+    if not inspection.exists:
+        return
+    if inspection.protected:
+        raise BootstrapError(f"refusing to delete protected branch: {branch}")
+    if inspection.used_by_worktrees:
+        raise BootstrapError("refusing to delete a branch used by another worktree")
+    if expected_oid is not None and inspection.head_oid != expected_oid:
+        raise BootstrapError("branch changed after it was displayed; review it again")
+    flag = "-D" if force else "-d"
+    result = _run_git(inspection.repo_root, ["branch", flag, "--", inspection.branch], check=False)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or "Git refused the branch deletion"
+        raise BootstrapError(detail)
+
+
+def _record_cleanup_result(
+    state_dir: Path,
+    record: Mapping[str, Any],
+    outcome: str,
+    *,
+    error: Optional[str] = None,
+) -> None:
+    payload: Dict[str, Any] = {
+        "version": 1,
+        "finished_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "id": record.get("id"),
+        "repo_root": record.get("repo_root"),
+        "branch": record.get("branch"),
+        "outcome": outcome,
+    }
+    if error:
+        payload["error"] = error
+    _atomic_write_json(state_dir / BRANCH_CLEANUP_DIR / "last-result.json", payload)
+
+
+def _resolve_pending_cleanup(
+    state_dir: Path,
+    record: Mapping[str, Any],
+    outcome: str,
+) -> None:
+    _record_cleanup_result(state_dir, record, outcome)
+    cleanup_id = record.get("id")
+    if isinstance(cleanup_id, str):
+        with contextlib.suppress(FileNotFoundError):
+            pending_cleanup_path(state_dir, cleanup_id).unlink()
+
+
+def _yes_no_unknown(value: Optional[bool]) -> str:
+    if value is True:
+        return "yes"
+    if value is False:
+        return "no"
+    return "unknown"
+
+
+def _safe_terminal_text(value: Any, limit: int = 240) -> str:
+    text = str(value)
+    sanitized = "".join(
+        character if ord(character) >= 32 and ord(character) != 127 else " "
+        for character in text
+    )
+    return " ".join(sanitized.split())[:limit]
+
+
+def review_pending_cleanups(
+    state_dir: Path,
+    *,
+    cleanup_id: Optional[str] = None,
+    input_fn: Callable[[str], str] = input,
+    output_fn: Callable[[str], None] = print,
+) -> int:
+    records = list_pending_cleanups(state_dir)
+    if cleanup_id:
+        records = [record for record in records if record.get("id") == cleanup_id]
+    if not records:
+        output_fn("No pending branch cleanups.")
+        return 0
+
+    for record in records:
+        repo_value = record.get("repo_root")
+        branch_value = record.get("branch")
+        if not isinstance(repo_value, str) or not isinstance(branch_value, str):
+            output_fn("Skipping an invalid pending branch cleanup record.")
+            continue
+        try:
+            inspection = inspect_branch(Path(repo_value), branch_value)
+        except BootstrapError as exc:
+            output_fn(
+                f"Cannot inspect {_safe_terminal_text(branch_value)}: "
+                f"{_safe_terminal_text(exc)}"
+            )
+            output_fn("The request remains pending for later review.")
+            continue
+
+        _clear_screen()
+        output_fn("Herdr branch cleanup review")
+        output_fn("")
+        output_fn(f"Repository: {_safe_terminal_text(inspection.repo_root)}")
+        output_fn(
+            f"Removed worktree: "
+            f"{_safe_terminal_text(record.get('worktree_path', 'unknown'))}"
+        )
+        output_fn(f"Branch: {_safe_terminal_text(inspection.branch)}")
+        output_fn(f"Last commit: {_safe_terminal_text(inspection.last_commit or 'unknown')}")
+        output_fn(
+            f"Default branch ref: {_safe_terminal_text(inspection.default_ref or 'unknown')}"
+        )
+        output_fn(f"Merged into default: {_yes_no_unknown(inspection.merged_into_default)}")
+        output_fn(f"Upstream: {_safe_terminal_text(inspection.upstream or 'none')}")
+        if inspection.ahead is not None and inspection.behind is not None:
+            output_fn(f"Upstream distance: ahead {inspection.ahead}, behind {inspection.behind}")
+        output_fn("Remote branches are never deleted by this plugin.")
+        if record.get("forced_worktree_removal"):
+            output_fn("Warning: the worktree itself was removed with --force.")
+
+        if not inspection.exists:
+            output_fn("The local branch no longer exists; marking this request resolved.")
+            _resolve_pending_cleanup(state_dir, record, "already_absent")
+            continue
+        if inspection.protected:
+            output_fn("Deletion blocked: this is a protected/default branch.")
+        if inspection.used_by_worktrees:
+            output_fn("Deletion blocked: branch is used by another worktree:")
+            for path in inspection.used_by_worktrees:
+                output_fn(f"  {_safe_terminal_text(path)}")
+
+        while True:
+            if inspection.protected or inspection.used_by_worktrees:
+                prompt = "[K]eep branch (default)  [S]kip for later  [Q]uit: "
+            else:
+                prompt = "[K]eep (default)  [D]elete safely  [F]orce delete...  [S]kip  [Q]uit: "
+            try:
+                choice = input_fn(prompt).strip().lower()
+            except EOFError:
+                output_fn("No interactive input; request remains pending.")
+                return 0
+            if choice in ("", "k", "keep"):
+                _resolve_pending_cleanup(state_dir, record, "kept")
+                output_fn(f"Kept local branch {inspection.branch}.")
+                break
+            if choice in ("s", "skip"):
+                output_fn("Request left pending for later review.")
+                break
+            if choice in ("q", "quit"):
+                return 0
+            if choice in ("d", "delete") and not inspection.protected and not inspection.used_by_worktrees:
+                try:
+                    delete_local_branch(
+                        inspection.repo_root,
+                        inspection.branch,
+                        force=False,
+                        expected_oid=inspection.head_oid,
+                    )
+                except BootstrapError as exc:
+                    _record_cleanup_result(state_dir, record, "safe_delete_failed", error=str(exc))
+                    output_fn(f"Safe deletion refused: {_safe_terminal_text(exc)}")
+                    output_fn("The request remains pending. Use force only after reviewing unmerged commits.")
+                    inspection = inspect_branch(inspection.repo_root, inspection.branch)
+                    continue
+                _resolve_pending_cleanup(state_dir, record, "deleted_safely")
+                output_fn(f"Deleted local branch {inspection.branch} safely.")
+                break
+            if choice in ("f", "force") and not inspection.protected and not inspection.used_by_worktrees:
+                output_fn("Force deletion can discard commits not merged into the default branch.")
+                try:
+                    confirmation = input_fn(f"Type '{inspection.branch}' to force-delete: ").strip()
+                except EOFError:
+                    output_fn("No confirmation; request remains pending.")
+                    return 0
+                if confirmation != inspection.branch:
+                    output_fn("Branch name did not match; nothing was deleted.")
+                    continue
+                try:
+                    delete_local_branch(
+                        inspection.repo_root,
+                        inspection.branch,
+                        force=True,
+                        expected_oid=inspection.head_oid,
+                    )
+                except BootstrapError as exc:
+                    _record_cleanup_result(state_dir, record, "force_delete_failed", error=str(exc))
+                    output_fn(f"Force deletion failed: {_safe_terminal_text(exc)}")
+                    inspection = inspect_branch(inspection.repo_root, inspection.branch)
+                    continue
+                _resolve_pending_cleanup(state_dir, record, "deleted_forcibly")
+                output_fn(f"Force-deleted local branch {inspection.branch}.")
+                break
+            output_fn("Unknown or unavailable choice.")
+    return 0
+
+
+def _herdr_command(env: Mapping[str, str]) -> Optional[str]:
+    configured = env.get("HERDR_BIN_PATH")
+    if configured:
+        return configured
+    return shutil.which("herdr")
+
+
+def launch_branch_cleanup_popup(
+    cleanup_id: str,
+    branch: str,
+    env: Mapping[str, str],
+) -> bool:
+    herdr = _herdr_command(env)
+    if not herdr:
+        return False
+    command = [
+        herdr,
+        "plugin",
+        "pane",
+        "open",
+        "--plugin",
+        PLUGIN_ID,
+        "--entrypoint",
+        "branch-cleanup",
+        "--placement",
+        "popup",
+        "--width",
+        "72%",
+        "--height",
+        "72%",
+        "--focus",
+        "--env",
+        f"HERDR_BRANCH_CLEANUP_ID={cleanup_id}",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if result.returncode == 0:
+        return True
+    with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+        subprocess.run(
+            [
+                herdr,
+                "notification",
+                "show",
+                "Branch cleanup pending",
+                "--body",
+                f"Review local branch {branch} from the Worktree Bootstrap action.",
+                "--sound",
+                "request",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=5,
+        )
+    return False
+
+
+def handle_branch_cleanup_event(
+    env: Mapping[str, str],
+    state_dir: Path,
+    *,
+    open_popup: bool = True,
+) -> Mapping[str, Any]:
+    pending = queue_branch_cleanup(env, state_dir)
+    popup_opened = False
+    if open_popup:
+        popup_opened = launch_branch_cleanup_popup(str(pending["id"]), str(pending["branch"]), env)
+    result = dict(pending)
+    result["popup_opened"] = popup_opened
+    print(
+        f"queued branch cleanup for {pending['branch']}; "
+        f"popup={'opened' if popup_opened else 'pending'}",
+        flush=True,
+    )
+    return result
+
+
 def target_key(context: RepositoryContext) -> str:
     value = f"{context.common_git_dir}\0{context.target}".encode("utf-8", "surrogateescape")
     return hashlib.sha256(value).hexdigest()[:24]
@@ -771,6 +1383,12 @@ def status_lines(context: RepositoryContext, state_dir: Path) -> Tuple[List[str]
         if last.get("error"):
             summary += f", error={last['error']}"
         lines.append(f"Last run: {summary}")
+    pending_count = 0
+    for pending in list_pending_cleanups(state_dir):
+        repo_value = pending.get("repo_root")
+        if isinstance(repo_value, str) and _canonical(Path(repo_value)) == context.source:
+            pending_count += 1
+    lines.append(f"Pending branch cleanups: {pending_count}")
     return lines, invalid
 
 
@@ -934,7 +1552,18 @@ def manage(context: RepositoryContext, state_dir: Path) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Bootstrap Herdr Git worktrees")
-    parser.add_argument("action", choices=("bootstrap", "sync", "setup", "status", "manage"))
+    parser.add_argument(
+        "action",
+        choices=(
+            "bootstrap",
+            "sync",
+            "setup",
+            "status",
+            "manage",
+            "branch-cleanup-event",
+            "branch-cleanup",
+        ),
+    )
     parser.add_argument("--target", help="explicit target checkout (primarily for testing/manual use)")
     parser.add_argument("--state-dir", help="override plugin state directory")
     return parser
@@ -945,6 +1574,12 @@ def main(argv: Optional[Sequence[str]] = None, env: Optional[Mapping[str, str]] 
     effective_env = os.environ if env is None else env
     state_dir = Path(args.state_dir).expanduser() if args.state_dir else default_state_dir(effective_env)
     try:
+        if args.action == "branch-cleanup-event":
+            handle_branch_cleanup_event(effective_env, state_dir)
+            return 0
+        if args.action == "branch-cleanup":
+            cleanup_id = effective_env.get("HERDR_BRANCH_CLEANUP_ID")
+            return review_pending_cleanups(state_dir, cleanup_id=cleanup_id)
         target_path = resolve_target_path(args.target, effective_env)
         context = resolve_repository(target_path)
         if args.action == "status":
@@ -953,6 +1588,8 @@ def main(argv: Optional[Sequence[str]] = None, env: Optional[Mapping[str, str]] 
             return 2 if invalid else 0
         if args.action == "manage":
             return manage(context, state_dir)
+        if args.action == "bootstrap":
+            record_worktree_mapping(context, state_dir)
         execute_action(args.action, context, state_dir)
         return 0
     except NothingToDo as exc:

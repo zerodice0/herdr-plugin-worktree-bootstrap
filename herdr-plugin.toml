@@ -1,8 +1,8 @@
 id = "zerodice0.worktree-bootstrap"
 name = "Worktree Bootstrap"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.7.0"
-description = "Copy ignored local files and run opt-in setup commands in new Git worktrees."
+description = "Bootstrap new worktrees and interactively review local branch cleanup after removal."
 platforms = ["linux", "macos"]
 
 [[actions]]
@@ -51,12 +51,44 @@ command = [
   "--focus",
 ]
 
+[[actions]]
+id = "review-branch-cleanup"
+title = "Review pending branch cleanup"
+contexts = ["workspace", "global"]
+command = [
+  "herdr",
+  "plugin",
+  "pane",
+  "open",
+  "--plugin",
+  "zerodice0.worktree-bootstrap",
+  "--entrypoint",
+  "branch-cleanup",
+  "--placement",
+  "popup",
+  "--width",
+  "72%",
+  "--height",
+  "72%",
+  "--focus",
+]
+
 [[events]]
 on = "worktree.created"
 command = ["python3", "worktree_bootstrap.py", "bootstrap"]
+
+[[events]]
+on = "worktree.removed"
+command = ["python3", "worktree_bootstrap.py", "branch-cleanup-event"]
 
 [[panes]]
 id = "manage"
 title = "Manage worktree bootstrap"
 placement = "popup"
 command = ["python3", "worktree_bootstrap.py", "manage"]
+
+[[panes]]
+id = "branch-cleanup"
+title = "Review branch cleanup"
+placement = "popup"
+command = ["python3", "worktree_bootstrap.py", "branch-cleanup"]

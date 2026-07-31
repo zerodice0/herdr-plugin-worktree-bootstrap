@@ -1,6 +1,6 @@
 # Herdr Worktree Bootstrap
 
-`zerodice0.worktree-bootstrap` prepares new [Herdr](https://herdr.dev/) Git worktrees by copying explicitly selected local files and then running explicitly configured setup commands.
+`zerodice0.worktree-bootstrap` prepares new [Herdr](https://herdr.dev/) Git worktrees by copying explicitly selected local files and running setup commands. After Herdr removes a worktree, it also offers an interactive review before deleting the associated local branch.
 
 It is deliberately conservative:
 
@@ -8,6 +8,7 @@ It is deliberately conservative:
 - only Git-ignored, untracked paths are copied;
 - directories replace the target directory instead of merging into it;
 - setup commands are argv arrays, run sequentially without a shell, and stop on the first failure;
+- branch retention is the default, safe deletion uses `git branch -d`, and force deletion requires typing the exact branch name;
 - there is no ecosystem detection and no automatic selection of dependency or build output directories.
 
 The plugin supports Herdr 0.7.0 or newer on Linux and macOS. It requires Python 3.9 or newer and uses only the Python standard library. It does not require `jq` or third-party Python packages.
@@ -17,7 +18,7 @@ The plugin supports Herdr 0.7.0 or newer on Linux and macOS. It requires Python 
 Install the tagged release from GitHub:
 
 ```sh
-herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.1.0
+herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.2.0
 ```
 
 For local development, link this checkout:
@@ -26,7 +27,7 @@ For local development, link this checkout:
 herdr plugin link .
 ```
 
-The plugin is opt-in per repository. If neither control file exists in the primary checkout, all automatic events exit successfully without changing anything.
+Copying and setup are opt-in per repository. If neither control file exists in the primary checkout, worktree creation does not change project files. Branch cleanup review is global but never deletes a branch without an explicit interactive choice.
 
 ## Copy local files
 
@@ -93,12 +94,14 @@ The plugin exposes these Herdr actions:
 | `setup` | Run setup commands only. |
 | `status` | Validate both control files and show source/target presence, skip reasons, and the last result. |
 | `manage` | Open an 80% by 80% popup for add, delete, status, and manual sync. |
+| `review-branch-cleanup` | Review branch cleanups that could not be shown immediately or were skipped. |
 
 Invoke an action from the Herdr UI, or from the CLI:
 
 ```sh
 herdr plugin action invoke zerodice0.worktree-bootstrap.status
 herdr plugin action invoke zerodice0.worktree-bootstrap.manage
+herdr plugin action invoke zerodice0.worktree-bootstrap.review-branch-cleanup
 ```
 
 The management popup scans only direct children of the repository root. It labels them as included, addable/ignored, tracked, or unignored. To add a nested path, type its repository-relative path; ignored directories are not recursively walked.
@@ -108,6 +111,36 @@ The management popup scans only direct children of the repository root. It label
 The `worktree.created` event runs `bootstrap`. Herdr event commands are post-creation asynchronous hooks: the worktree and its initial pane already exist when bootstrap starts. Do not depend on bootstrap completing before a separate automatic build or development server starts. That kind of cross-hook ordering is not provided by this plugin.
 
 The source is always the primary non-bare checkout from `git worktree list --porcelain`. The plugin verifies that source and target share the same common Git directory. It safely does nothing for the primary checkout itself, bare repositories, unavailable primary checkouts, or repositories with no control files.
+
+## Branch cleanup after worktree removal
+
+Herdr intentionally removes a worktree checkout without deleting its branch. This plugin listens for `worktree.removed`, records a pending cleanup request, inspects the local branch, and attempts to open a session-modal terminal popup.
+
+The popup shows:
+
+- repository, removed worktree, branch, and last commit;
+- whether the branch is merged into the detected default branch;
+- upstream and ahead/behind information when available;
+- whether another worktree still uses the branch;
+- whether the worktree itself was removed with `--force`.
+
+The choices are:
+
+- **Keep** (default): retain the branch and resolve the request.
+- **Delete safely**: run `git branch -d`; Git refuses deletion when the branch is not merged according to its normal safety rules.
+- **Force delete**: display an unmerged-commit warning and require typing the exact branch name before running `git branch -D`.
+- **Skip**: keep the request pending for later review.
+
+`main`, `master`, `develop`, `development`, `trunk`, the detected default branch, and any branch checked out in another worktree cannot be deleted from the popup. Branch state is inspected again immediately before deletion to close the race between display and confirmation. Remote branches are displayed through upstream status but are never deleted.
+
+The hook runs after Herdr has removed the worktree. Herdr v1 does not expose a pre-remove interception or native yes/no dialog API, so this plugin cannot modify the built-in removal confirmation. If no foreground client exists or another popup is busy, the handler never deletes anything; the resolved request remains under `HERDR_PLUGIN_STATE_DIR` and can be reopened with:
+
+```sh
+herdr plugin action invoke zerodice0.worktree-bootstrap.review-branch-cleanup
+```
+
+The plugin caches worktree-to-primary-checkout provenance when `worktree.created` fires so removal events with a missing workspace snapshot can still be reviewed safely. Detached worktrees have no local branch cleanup and are ignored.
+If neither the removal event nor that cache can identify and validate the primary checkout, the event is logged and no cleanup request or branch deletion is attempted.
 
 ## Copy and failure guarantees
 
@@ -136,7 +169,7 @@ Before validation, find and disable the old plugin:
 ```sh
 herdr plugin list
 herdr plugin disable OLD_PLUGIN_ID
-herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.1.0
+herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.2.0
 ```
 
 To roll back, disable this plugin and re-enable the previous one. Control files are left untouched:

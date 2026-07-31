@@ -1,0 +1,62 @@
+id = "zerodice0.worktree-bootstrap"
+name = "Worktree Bootstrap"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Copy ignored local files and run opt-in setup commands in new Git worktrees."
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "bootstrap"
+title = "Bootstrap worktree"
+contexts = ["workspace"]
+command = ["python3", "worktree_bootstrap.py", "bootstrap"]
+
+[[actions]]
+id = "sync"
+title = "Sync local worktree files"
+contexts = ["workspace"]
+command = ["python3", "worktree_bootstrap.py", "sync"]
+
+[[actions]]
+id = "setup"
+title = "Run worktree setup"
+contexts = ["workspace"]
+command = ["python3", "worktree_bootstrap.py", "setup"]
+
+[[actions]]
+id = "status"
+title = "Show worktree bootstrap status"
+contexts = ["workspace"]
+command = ["python3", "worktree_bootstrap.py", "status"]
+
+[[actions]]
+id = "manage"
+title = "Manage worktree bootstrap"
+contexts = ["workspace"]
+command = [
+  "herdr",
+  "plugin",
+  "pane",
+  "open",
+  "--plugin",
+  "zerodice0.worktree-bootstrap",
+  "--entrypoint",
+  "manage",
+  "--placement",
+  "popup",
+  "--width",
+  "80%",
+  "--height",
+  "80%",
+  "--focus",
+]
+
+[[events]]
+on = "worktree.created"
+command = ["python3", "worktree_bootstrap.py", "bootstrap"]
+
+[[panes]]
+id = "manage"
+title = "Manage worktree bootstrap"
+placement = "popup"
+command = ["python3", "worktree_bootstrap.py", "manage"]

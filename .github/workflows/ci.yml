@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Compile
+        run: python -m py_compile worktree_bootstrap.py tests/herdr_environment_smoke.py
+      - name: Unit and integration tests
+        run: python -m unittest discover -s tests -v
+
+  herdr-smoke:
+    name: Herdr 0.7.5 / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: herdr-linux-x86_64
+          - os: macos-latest
+            asset: herdr-macos-aarch64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Download Herdr 0.7.5
+        run: |
+          curl -fsSL "https://github.com/herdrdev/herdr/releases/download/v0.7.5/${{ matrix.asset }}" -o "$RUNNER_TEMP/herdr"
+          chmod +x "$RUNNER_TEMP/herdr"
+          "$RUNNER_TEMP/herdr" --version
+      - name: Validate and link manifest
+        env:
+          XDG_CONFIG_HOME: ${{ runner.temp }}/xdg-config
+          XDG_DATA_HOME: ${{ runner.temp }}/xdg-data
+          XDG_STATE_HOME: ${{ runner.temp }}/xdg-state
+        run: |
+          "$RUNNER_TEMP/herdr" plugin link .
+          "$RUNNER_TEMP/herdr" plugin list --plugin zerodice0.worktree-bootstrap --json
+      - name: Smoke-test Herdr action and event environments
+        run: python tests/herdr_environment_smoke.py

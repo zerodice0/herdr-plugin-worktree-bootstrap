@@ -14,6 +14,7 @@ import dataclasses
 import datetime as dt
 import fcntl
 import hashlib
+import itertools
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -40,7 +41,10 @@ BRANCH_CLEANUP_DIR = "branch-cleanup"
 WORKTREE_MAP_DIR = "worktree-map"
 PROTECTED_BRANCHES = frozenset({"main", "master", "develop", "development", "trunk"})
 ANSI_RESET = "\033[0m"
+MIN_ACTION_FOOTER_COLUMNS = 32
+ACTION_GROUP_GAP = 4
 ColorValue = Optional[Union[int, Tuple[int, int, int]]]
+ActionSpec = Tuple[str, str, str]
 
 
 class BootstrapError(RuntimeError):
@@ -1538,6 +1542,70 @@ def _flat_separator(
     return _style_text(value, palette, "subtle", enabled=color_enabled, dim=True)
 
 
+def _action_row_width(actions: Sequence[ActionSpec]) -> int:
+    groups = [_display_width(f"{key} {label}") for key, label, _role in actions]
+    return sum(groups) + ACTION_GROUP_GAP * max(0, len(groups) - 1)
+
+
+def _balanced_action_rows(
+    actions: Sequence[ActionSpec],
+    available_width: int,
+) -> List[List[ActionSpec]]:
+    """Use the fewest rows, then choose the most balanced contiguous split."""
+
+    action_list = list(actions)
+    if not action_list:
+        return []
+    for row_count in range(1, len(action_list) + 1):
+        candidates: List[Tuple[Tuple[int, int, Tuple[int, ...]], List[List[ActionSpec]]]] = []
+        for breaks in itertools.combinations(range(1, len(action_list)), row_count - 1):
+            boundaries = (0,) + breaks + (len(action_list),)
+            rows = [
+                action_list[boundaries[index]:boundaries[index + 1]]
+                for index in range(row_count)
+            ]
+            widths = tuple(_action_row_width(row) for row in rows)
+            if all(width <= available_width for width in widths):
+                score = (max(widths), max(widths) - min(widths), widths)
+                candidates.append((score, rows))
+        if candidates:
+            return min(candidates, key=lambda candidate: candidate[0])[1]
+    return [[action] for action in action_list]
+
+
+def _action_segments(actions: Sequence[ActionSpec]) -> List[StyledSegment]:
+    segments: List[StyledSegment] = []
+    for index, (key, label, role) in enumerate(actions):
+        if index:
+            segments.append(StyledSegment(" " * ACTION_GROUP_GAP))
+        segments.extend(
+            [StyledSegment(key, role, bold=True), StyledSegment(f" {label}")]
+        )
+    return segments
+
+
+def _render_action_rows(
+    actions: Sequence[ActionSpec],
+    width: int,
+    palette: ThemePalette,
+    *,
+    color_enabled: bool,
+) -> List[str]:
+    return [
+        _flat_line(
+            _action_segments(row),
+            width,
+            palette,
+            color_enabled=color_enabled,
+        )
+        for row in _balanced_action_rows(actions, max(1, width - 2))
+    ]
+
+
+def _supports_action_footer(decorated: bool, columns: int) -> bool:
+    return decorated and columns >= MIN_ACTION_FOOTER_COLUMNS
+
+
 def _friendly_path(value: Any) -> str:
     text = _safe_terminal_text(value)
     home = os.fspath(Path.home())
@@ -1597,10 +1665,10 @@ def render_cleanup_dialog(
     decorated: bool,
     color_enabled: bool,
 ) -> List[str]:
-    if not decorated or columns < 48:
+    if not _supports_action_footer(decorated, columns):
         return _plain_cleanup_dialog(inspection, record)
 
-    width = max(48, min(columns, 88))
+    width = max(MIN_ACTION_FOOTER_COLUMNS, min(columns, 88))
     status, status_role = _cleanup_status(inspection)
     lines = [
         "",
@@ -1676,25 +1744,20 @@ def render_cleanup_dialog(
     lines.extend(["", _flat_separator(width, palette, color_enabled=color_enabled)])
     blocked = inspection.protected or bool(inspection.used_by_worktrees)
     if blocked:
-        primary_actions = [
-            StyledSegment("ENTER", "accent", bold=True), StyledSegment(" Keep    ", "text"),
-            StyledSegment("S", "accent", bold=True), StyledSegment(" Later    ", "text"),
-            StyledSegment("Q", "accent", bold=True), StyledSegment(" Close", "text"),
+        actions: List[ActionSpec] = [
+            ("ENTER", "Keep", "accent"),
+            ("S", "Later", "accent"),
+            ("Q", "Close", "accent"),
         ]
-        secondary_actions: List[StyledSegment] = []
     else:
-        primary_actions = [
-            StyledSegment("ENTER", "accent", bold=True), StyledSegment(" Keep    ", "text"),
-            StyledSegment("D", "positive", bold=True), StyledSegment(" Delete safely", "text"),
+        actions = [
+            ("ENTER", "Keep", "accent"),
+            ("D", "Delete safely", "positive"),
+            ("F", "Force…", "danger"),
+            ("S", "Later", "accent"),
+            ("Q", "Close", "accent"),
         ]
-        secondary_actions = [
-            StyledSegment("F", "danger", bold=True), StyledSegment(" Force…    ", "text"),
-            StyledSegment("S", "accent", bold=True), StyledSegment(" Later    ", "text"),
-            StyledSegment("Q", "accent", bold=True), StyledSegment(" Close", "text"),
-        ]
-    lines.append(_flat_line(primary_actions, width, palette, color_enabled=color_enabled))
-    if secondary_actions:
-        lines.append(_flat_line(secondary_actions, width, palette, color_enabled=color_enabled))
+    lines.extend(_render_action_rows(actions, width, palette, color_enabled=color_enabled))
     lines.append("")
     return lines
 
@@ -1874,13 +1937,14 @@ def review_pending_cleanups(
             _resolve_pending_cleanup(state_dir, record, "already_absent")
             continue
 
-        single_key_mode = decorated and input_fn is input and sys.stdin.isatty()
+        action_footer_visible = _supports_action_footer(decorated, columns)
+        single_key_mode = action_footer_visible and input_fn is input and sys.stdin.isatty()
         while True:
             if inspection.protected or inspection.used_by_worktrees:
                 prompt = "[K]eep branch (default)  [S]kip for later  [Q]uit: "
             else:
                 prompt = "[K]eep (default)  [D]elete safely  [F]orce delete...  [S]kip  [Q]uit: "
-            if decorated and not single_key_mode:
+            if action_footer_visible and not single_key_mode:
                 prompt = _style_text(
                     "Select › ",
                     palette,

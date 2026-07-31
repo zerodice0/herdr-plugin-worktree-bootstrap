@@ -18,7 +18,7 @@ The plugin supports Herdr 0.7.0 or newer on Linux and macOS. It requires Python 
 Install the tagged release from GitHub:
 
 ```sh
-herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.2.2
+herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.2.3
 ```
 
 For local development, link this checkout:
@@ -131,7 +131,7 @@ The choices are:
 - **Force delete**: display an unmerged-commit warning and require typing the exact branch name before running `git branch -D`.
 - **Skip**: keep the request pending for later review.
 
-In the interactive popup, press `D`, `F`, `S`, or `Q` to act immediately; no Enter is required. Press Enter by itself to keep the branch. The exact branch-name confirmation for force deletion intentionally remains a typed value followed by Enter. If direct key reading is unavailable, the popup falls back to the same choices through normal line input.
+In the interactive popup, press `D`, `F`, `S`, or `Q` to act immediately; no Enter is required. Press Enter by itself to keep the branch. The action footer stays on one line when it fits and wraps into balanced, complete action groups on narrower terminals. The exact branch-name confirmation for force deletion intentionally remains a typed value followed by Enter. If direct key reading or a visible action footer is unavailable, the popup falls back to the same choices through normal line input.
 
 `main`, `master`, `develop`, `development`, `trunk`, the detected default branch, and any branch checked out in another worktree cannot be deleted from the popup. Branch state is inspected again immediately before deletion to close the race between display and confirmation. Remote branches are displayed through upstream status but are never deleted.
 
@@ -177,7 +177,7 @@ Before validation, find and disable the old plugin:
 ```sh
 herdr plugin list
 herdr plugin disable OLD_PLUGIN_ID
-herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.2.2
+herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.2.3
 ```
 
 To roll back, disable this plugin and re-enable the previous one. Control files are left untouched:

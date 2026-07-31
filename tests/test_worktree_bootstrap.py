@@ -207,9 +207,59 @@ accent = "cyan"
         self.assertNotIn("╭", rendered)
         self.assertNotIn("│", rendered)
         ansi = re.compile(r"\x1b\[[0-9;]*m")
+        visible_rendered = ansi.sub("", rendered)
+        self.assertIn(
+            "ENTER Keep    D Delete safely    F Force…    S Later    Q Close",
+            visible_rendered,
+        )
         for line in lines:
             visible = ansi.sub("", line)
             self.assertLessEqual(plugin._display_width(visible), 72)
+
+    def test_action_footer_uses_one_line_when_it_fits_and_balanced_rows_when_needed(self):
+        palette = plugin.resolve_theme_palette(plugin.ThemeSettings(name="tokyo-night"))
+        record = {"worktree_path": "/tmp/worktree", "forced_worktree_removal": False}
+
+        def action_lines(columns):
+            lines = plugin.render_cleanup_dialog(
+                self.inspection(),
+                record,
+                palette,
+                columns=columns,
+                decorated=True,
+                color_enabled=False,
+            )
+            return [
+                line.strip()
+                for line in lines
+                if "ENTER Keep" in line or "F Force…" in line
+            ]
+
+        self.assertEqual(
+            action_lines(65),
+            ["ENTER Keep    D Delete safely    F Force…    S Later    Q Close"],
+        )
+        expected_compact = [
+            "ENTER Keep    D Delete safely",
+            "F Force…    S Later    Q Close",
+        ]
+        self.assertEqual(action_lines(64), expected_compact)
+        self.assertEqual(action_lines(32), expected_compact)
+
+    def test_very_narrow_tty_uses_visible_line_input_fallback(self):
+        palette = plugin.resolve_theme_palette(plugin.ThemeSettings(name="tokyo-night"))
+        lines = plugin.render_cleanup_dialog(
+            self.inspection(),
+            {"worktree_path": "/tmp/worktree", "forced_worktree_removal": False},
+            palette,
+            columns=31,
+            decorated=True,
+            color_enabled=False,
+        )
+        self.assertFalse(plugin._supports_action_footer(True, 31))
+        self.assertTrue(plugin._supports_action_footer(True, 32))
+        self.assertNotIn("ENTER Keep", "\n".join(lines))
+        self.assertIn("Herdr branch cleanup review", lines)
 
     def test_non_tty_dialog_remains_plain_and_log_friendly(self):
         palette = plugin.resolve_theme_palette(plugin.ThemeSettings(name="tokyo-night"))

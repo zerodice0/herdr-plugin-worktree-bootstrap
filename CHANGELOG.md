@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## [0.2.3] - 2026-07-31
+
+- Keep the cleanup action footer on one line whenever its measured display width fits.
+- Wrap only at complete action boundaries and choose the most balanced layout on narrower terminals.
+- Fall back to a visible line-input prompt instead of waiting for an unlabelled key on very narrow TTYs.
+
 ## [0.2.2] - 2026-07-31
 
 - Remove the redundant plugin-drawn frame and use Herdr's popup frame as the only border.

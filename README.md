@@ -18,7 +18,7 @@ The plugin supports Herdr 0.7.0 or newer on Linux and macOS. It requires Python 
 Install the tagged release from GitHub:
 
 ```sh
-herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.2.3
+herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.3.0
 ```
 
 For local development, link this checkout:
@@ -79,7 +79,7 @@ Create `.herdr/worktree-setup.json` in the primary checkout:
 
 Every command runs in the target worktree root. Commands run in array order. A non-zero exit, timeout, or missing executable stops the sequence immediately. The plugin does not invoke a shell, expand environment variables in argv, or implement platform branches.
 
-This file is also local opt-in configuration. When the management popup sees it, the popup adds `/.herdr/worktree-setup.json` to `.git/info/exclude`. The setup list is read-only in the popup; edit the JSON file directly.
+This file is also local opt-in configuration. When the management popup sees it, the popup adds `/.herdr/worktree-setup.json` to `.git/info/exclude`.
 
 Use setup for terminating jobs such as `npm ci`, `bundle install`, or `flutter pub get`. Long-running processes such as `npm run dev`, file watchers, and `flutter run` are outside v1's scope.
 
@@ -93,7 +93,7 @@ The plugin exposes these Herdr actions:
 | `sync` | Copy eligible paths only. |
 | `setup` | Run setup commands only. |
 | `status` | Validate both control files and show source/target presence, skip reasons, and the last result. |
-| `manage` | Open an 80% by 80% popup for add, delete, status, and manual sync. |
+| `manage` | Open an 80% by 80% popup for files, setup command editing, status, and manual sync. |
 | `review-branch-cleanup` | Review branch cleanups that could not be shown immediately or were skipped. |
 
 Invoke an action from the Herdr UI, or from the CLI:
@@ -105,6 +105,20 @@ herdr plugin action invoke zerodice0.worktree-bootstrap.review-branch-cleanup
 ```
 
 The management popup scans only direct children of the repository root. It labels them as included, addable/ignored, tracked, or unignored. To add a nested path, type its repository-relative path; ignored directories are not recursively walked.
+
+### Configure setup commands in the management popup
+
+Open the management popup and choose `c` to configure setup commands. The setup editor supports:
+
+```text
+[n] new       [e] edit       [x] delete
+[u] move up   [j] move down  [r] run now
+[k] remove configuration    [q] back
+```
+
+When adding or editing a command, enter its display name, one argv command line, and a positive timeout. Quotes are parsed into argv entries; no shell is invoked and environment variables are not expanded. For example, entering `npm ci` stores two argv entries, `npm` and `ci`, while `tool "local data/input.json"` keeps the path as one argument. Each change is validated and atomically saved to `.herdr/worktree-setup.json`; deleting the configuration requires confirmation.
+
+`r` runs the saved setup immediately in the current target worktree. The same fail-fast, timeout, and command-not-found rules used by automatic bootstrap apply to this manual run.
 
 ## Automatic worktree bootstrap
 
@@ -177,7 +191,7 @@ Before validation, find and disable the old plugin:
 ```sh
 herdr plugin list
 herdr plugin disable OLD_PLUGIN_ID
-herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.2.3
+herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.3.0
 ```
 
 To roll back, disable this plugin and re-enable the previous one. Control files are left untouched:

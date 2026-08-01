@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## [0.3.0] - 2026-08-01
+
+- Add a setup command editor to the management popup.
+- Support adding, editing, deleting, reordering, and manually running setup commands without editing JSON by hand.
+- Parse quoted command lines into argv arrays without invoking a shell or expanding environment variables.
+- Atomically save validated setup configuration and require confirmation before removing it.
+
 ## [0.2.3] - 2026-07-31
 
 - Keep the cleanup action footer on one line whenever its measured display width fits.

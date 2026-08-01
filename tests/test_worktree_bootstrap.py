@@ -594,6 +594,75 @@ class SetupBehaviorTests(GitRepositoryTestCase):
         with self.assertRaises(plugin.BootstrapError):
             plugin.load_setup_commands(self.source)
 
+    def test_setup_writer_round_trips_and_excludes_local_configuration(self):
+        command = plugin.SetupCommand("Install dependencies", ("npm", "ci"), 900)
+        plugin.write_setup_commands(self.context, [command])
+        self.assertEqual(plugin.load_setup_commands(self.source), [command])
+        exclude = self.context.common_git_dir / "info" / "exclude"
+        self.assertIn("/.herdr/worktree-setup.json\n", exclude.read_text(encoding="utf-8"))
+
+    def test_setup_argv_editor_preserves_quoted_arguments_without_shell_expansion(self):
+        self.assertEqual(
+            plugin._parse_setup_argv('tool "local data/input.json" $HOME'),
+            ("tool", "local data/input.json", "$HOME"),
+        )
+
+    def test_setup_editor_adds_and_edits_commands(self):
+        answers = iter(
+            [
+                "n",
+                "Install dependencies",
+                "npm ci",
+                "300",
+                "",
+                "e",
+                "1",
+                "",
+                "npm install",
+                "600",
+                "",
+                "q",
+            ]
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            with mock.patch("builtins.input", side_effect=answers):
+                self.assertEqual(plugin.manage_setup_commands(self.context, self.state_dir, []), 0)
+        self.assertEqual(
+            plugin.load_setup_commands(self.source),
+            [plugin.SetupCommand("Install dependencies", ("npm", "install"), 600)],
+        )
+
+    def test_setup_editor_reorders_and_deletes_with_confirmation(self):
+        commands = [
+            plugin.SetupCommand("First", ("first",), 30),
+            plugin.SetupCommand("Second", ("second",), 60),
+        ]
+        plugin.write_setup_commands(self.context, commands)
+        answers = iter(["u", "2", "", "x", "2", "y", "", "q"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            with mock.patch("builtins.input", side_effect=answers):
+                self.assertEqual(plugin.manage_setup_commands(self.context, self.state_dir, commands), 0)
+        self.assertEqual(
+            plugin.load_setup_commands(self.source),
+            [plugin.SetupCommand("Second", ("second",), 60)],
+        )
+
+    def test_setup_editor_runs_setup_now(self):
+        command = plugin.SetupCommand(
+            "Create marker",
+            (sys.executable, "-c", "from pathlib import Path; Path('setup-marker').touch()"),
+            5,
+        )
+        plugin.write_setup_commands(self.context, [command])
+        answers = iter(["r", "", "q"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            with mock.patch("builtins.input", side_effect=answers):
+                self.assertEqual(
+                    plugin.manage_setup_commands(self.context, self.state_dir, [command]),
+                    0,
+                )
+        self.assertTrue((self.target / "setup-marker").exists())
+
     def test_unknown_schema_fields_are_rejected(self):
         command = self.command("bad", "pass")
         command["shell"] = True

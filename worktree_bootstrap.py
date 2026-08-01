@@ -20,6 +20,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import select
+import shlex
 import shutil
 import signal
 import stat
@@ -2364,6 +2365,216 @@ def write_copy_list(context: RepositoryContext, paths: Sequence[str]) -> None:
             os.unlink(temporary)
 
 
+def _normalize_setup_commands(commands: Sequence[SetupCommand]) -> List[SetupCommand]:
+    normalized: List[SetupCommand] = []
+    for index, command in enumerate(commands, 1):
+        label = f"setup command {index}"
+        if not isinstance(command, SetupCommand):
+            raise BootstrapError(f"{label} must be a SetupCommand")
+        name = command.name.strip()
+        argv = tuple(command.argv)
+        timeout = command.timeout_seconds
+        if not name:
+            raise BootstrapError(f"{label} name must be a non-empty string")
+        if not argv or not all(isinstance(arg, str) for arg in argv) or not argv[0]:
+            raise BootstrapError(f"{label} argv must be a non-empty array of strings")
+        if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0:
+            raise BootstrapError(f"{label} timeout_seconds must be a positive integer")
+        normalized.append(SetupCommand(name=name, argv=argv, timeout_seconds=timeout))
+    return normalized
+
+
+def write_setup_commands(
+    context: RepositoryContext,
+    commands: Sequence[SetupCommand],
+) -> None:
+    normalized = _normalize_setup_commands(commands)
+    ensure_control_excluded(context, SETUP_FILE)
+    _atomic_write_json(
+        context.source / SETUP_FILE,
+        {
+            "version": 1,
+            "commands": [
+                {
+                    "name": command.name,
+                    "argv": list(command.argv),
+                    "timeout_seconds": command.timeout_seconds,
+                }
+                for command in normalized
+            ],
+        },
+    )
+
+
+def remove_setup_configuration(context: RepositoryContext) -> None:
+    with contextlib.suppress(FileNotFoundError):
+        (context.source / SETUP_FILE).unlink()
+
+
+def _prompt_default(prompt: str, default: str) -> str:
+    value = input(f"{prompt} [{default}]: ").strip()
+    return default if not value else value
+
+
+def _parse_setup_argv(value: str) -> Tuple[str, ...]:
+    try:
+        argv = tuple(shlex.split(value, comments=False, posix=True))
+    except ValueError as exc:
+        raise BootstrapError(f"invalid command arguments: {exc}") from exc
+    if not argv or not argv[0]:
+        raise BootstrapError("command arguments must include an executable")
+    return argv
+
+
+def _prompt_setup_command(existing: Optional[SetupCommand] = None) -> SetupCommand:
+    print("\nSetup command editor")
+    name_default = existing.name if existing else "Install dependencies"
+    argv_default = shlex.join(existing.argv) if existing else "npm ci"
+    timeout_default = str(existing.timeout_seconds) if existing else "900"
+    name = _prompt_default("Name", name_default)
+    argv = _parse_setup_argv(_prompt_default("Command argv (quotes supported)", argv_default))
+    timeout_value = _prompt_default("Timeout seconds", timeout_default)
+    try:
+        timeout = int(timeout_value)
+    except ValueError as exc:
+        raise BootstrapError("timeout must be a positive integer") from exc
+    if timeout <= 0:
+        raise BootstrapError("timeout must be a positive integer")
+    return SetupCommand(name=name, argv=argv, timeout_seconds=timeout)
+
+
+def _prompt_setup_index(commands: Sequence[SetupCommand], prompt: str) -> Optional[int]:
+    if not commands:
+        print("No setup commands configured.")
+        input("Press Enter.")
+        return None
+    raw = input(prompt).strip()
+    try:
+        index = int(raw) - 1
+    except ValueError:
+        print("Invalid command number.")
+        input("Press Enter.")
+        return None
+    if index < 0 or index >= len(commands):
+        print("Invalid command number.")
+        input("Press Enter.")
+        return None
+    return index
+
+
+def _print_setup_commands(commands: Sequence[SetupCommand]) -> None:
+    print("\nSetup commands (saved in .herdr/worktree-setup.json):")
+    if not commands:
+        print("  (none)")
+        return
+    for index, command in enumerate(commands, 1):
+        print(f"  {index:>2}. {command.name}")
+        print(f"      argv: {shlex.join(command.argv)}")
+        print(f"      timeout: {command.timeout_seconds}s")
+
+
+def manage_setup_commands(
+    context: RepositoryContext,
+    state_dir: Path,
+    commands: Sequence[SetupCommand],
+) -> int:
+    current = list(commands)
+    while True:
+        _clear_screen()
+        print("Herdr Worktree Bootstrap › Setup commands")
+        print(f"Primary checkout: {context.source}")
+        _print_setup_commands(current)
+        print(
+            "\n[n] new  [e] edit  [x] delete  [u] move up  [j] move down  "
+            "[r] run now  [k] remove config  [q] back"
+        )
+        try:
+            choice = input("> ").strip().lower()
+        except EOFError:
+            return 0
+        if choice in ("", "q"):
+            return 0
+        if choice == "n":
+            try:
+                command = _prompt_setup_command()
+                write_setup_commands(context, [*current, command])
+                current.append(command)
+                print("Saved setup command. Press Enter.")
+            except BootstrapError as exc:
+                print(f"Not saved: {exc}. Press Enter.")
+            input()
+            continue
+        if choice == "e":
+            index = _prompt_setup_index(current, "Command number to edit: ")
+            if index is None:
+                continue
+            try:
+                command = _prompt_setup_command(current[index])
+                updated = current[:index] + [command] + current[index + 1:]
+                write_setup_commands(context, updated)
+                current = updated
+                print("Saved setup command. Press Enter.")
+            except BootstrapError as exc:
+                print(f"Not saved: {exc}. Press Enter.")
+            input()
+            continue
+        if choice == "x":
+            index = _prompt_setup_index(current, "Command number to delete: ")
+            if index is None:
+                continue
+            command = current[index]
+            if input(f"Delete '{command.name}'? [y/N]: ").strip().lower() != "y":
+                print("Kept setup command. Press Enter.")
+                input()
+                continue
+            updated = current[:index] + current[index + 1:]
+            write_setup_commands(context, updated)
+            current = updated
+            print("Deleted and saved setup command. Press Enter.")
+            input()
+            continue
+        if choice in ("u", "j"):
+            index = _prompt_setup_index(current, "Command number to move: ")
+            if index is None:
+                continue
+            destination = index - 1 if choice == "u" else index + 1
+            if destination < 0 or destination >= len(current):
+                print("Command is already at that edge. Press Enter.")
+                input()
+                continue
+            updated = current[:]
+            updated[index], updated[destination] = updated[destination], updated[index]
+            write_setup_commands(context, updated)
+            current = updated
+            print("Reordered and saved setup commands. Press Enter.")
+            input()
+            continue
+        if choice == "r":
+            try:
+                execute_action("setup", context, state_dir)
+            except (BootstrapError, NothingToDo) as exc:
+                print(exc)
+            print("Press Enter.")
+            input()
+            continue
+        if choice == "k":
+            if not (context.source / SETUP_FILE).exists():
+                print("Setup configuration does not exist. Press Enter.")
+                input()
+                continue
+            if input("Remove the setup configuration? [y/N]: ").strip().lower() != "y":
+                print("Kept setup configuration. Press Enter.")
+                input()
+                continue
+            remove_setup_configuration(context)
+            current = []
+            print("Removed setup configuration. Press Enter.")
+            input()
+            continue
+        print("Unknown choice. Press Enter.")
+        input()
+
+
 def _direct_root_items(context: RepositoryContext, included: Sequence[str]) -> List[Tuple[str, str]]:
     included_set = set(included)
     rows: List[Tuple[str, str]] = []
@@ -2421,13 +2632,11 @@ def manage(context: RepositoryContext, state_dir: Path) -> int:
         print("\nRepository root (not recursively scanned):")
         for name, label in root_items:
             print(f"  [{label}] {name}")
-        print("\nSetup commands (read-only; edit .herdr/worktree-setup.json):")
-        if commands:
-            for command in commands:
-                print(f"  {command.name}: {list(command.argv)!r} ({command.timeout_seconds}s)")
-        else:
-            print("  (none)")
-        print("\n[a] add path  [d] delete path  [s] sync now  [t] status  [r] refresh  [q] quit")
+        _print_setup_commands(commands)
+        print(
+            "\n[a] add path  [d] delete path  [c] configure setup  "
+            "[s] sync now  [t] status  [r] refresh  [q] quit"
+        )
         choice = input("> ").strip().lower()
         if choice == "q":
             return 0
@@ -2464,6 +2673,9 @@ def manage(context: RepositoryContext, state_dir: Path) -> int:
             write_copy_list(context, paths[:index] + paths[index + 1 :])
             print(f"Removed {removed}. Press Enter.")
             input()
+            continue
+        if choice == "c":
+            manage_setup_commands(context, state_dir, commands)
             continue
         if choice == "s":
             try:

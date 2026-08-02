@@ -20,6 +20,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import select
+import shlex
 import shutil
 import signal
 import stat
@@ -2364,6 +2365,559 @@ def write_copy_list(context: RepositoryContext, paths: Sequence[str]) -> None:
             os.unlink(temporary)
 
 
+def _normalize_setup_commands(commands: Sequence[SetupCommand]) -> List[SetupCommand]:
+    normalized: List[SetupCommand] = []
+    for index, command in enumerate(commands, 1):
+        label = f"setup command {index}"
+        if not isinstance(command, SetupCommand):
+            raise BootstrapError(f"{label} must be a SetupCommand")
+        name = command.name.strip()
+        argv = tuple(command.argv)
+        timeout = command.timeout_seconds
+        if not name:
+            raise BootstrapError(f"{label} name must be a non-empty string")
+        if not argv or not all(isinstance(arg, str) for arg in argv) or not argv[0]:
+            raise BootstrapError(f"{label} argv must be a non-empty array of strings")
+        if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0:
+            raise BootstrapError(f"{label} timeout_seconds must be a positive integer")
+        normalized.append(SetupCommand(name=name, argv=argv, timeout_seconds=timeout))
+    return normalized
+
+
+def write_setup_commands(
+    context: RepositoryContext,
+    commands: Sequence[SetupCommand],
+) -> None:
+    normalized = _normalize_setup_commands(commands)
+    ensure_control_excluded(context, SETUP_FILE)
+    _atomic_write_json(
+        context.source / SETUP_FILE,
+        {
+            "version": 1,
+            "commands": [
+                {
+                    "name": command.name,
+                    "argv": list(command.argv),
+                    "timeout_seconds": command.timeout_seconds,
+                }
+                for command in normalized
+            ],
+        },
+    )
+
+
+def remove_setup_configuration(context: RepositoryContext) -> None:
+    with contextlib.suppress(FileNotFoundError):
+        (context.source / SETUP_FILE).unlink()
+
+
+def _prompt_default(prompt: str, default: str) -> str:
+    value = input(f"{prompt} [{default}]: ").strip()
+    return default if not value else value
+
+
+def _parse_setup_argv(value: str) -> Tuple[str, ...]:
+    try:
+        argv = tuple(shlex.split(value, comments=False, posix=True))
+    except ValueError as exc:
+        raise BootstrapError(f"invalid command arguments: {exc}") from exc
+    if not argv or not argv[0]:
+        raise BootstrapError("command arguments must include an executable")
+    return argv
+
+
+def _prompt_setup_command(existing: Optional[SetupCommand] = None) -> SetupCommand:
+    name_default = existing.name if existing else "Install dependencies"
+    argv_default = shlex.join(existing.argv) if existing else "npm ci"
+    timeout_default = str(existing.timeout_seconds) if existing else "900"
+    name = _prompt_default("Name", name_default)
+    argv = _parse_setup_argv(_prompt_default("Command argv (quotes supported)", argv_default))
+    timeout_value = _prompt_default("Timeout seconds", timeout_default)
+    try:
+        timeout = int(timeout_value)
+    except ValueError as exc:
+        raise BootstrapError("timeout must be a positive integer") from exc
+    if timeout <= 0:
+        raise BootstrapError("timeout must be a positive integer")
+    return SetupCommand(name=name, argv=argv, timeout_seconds=timeout)
+
+
+def _prompt_setup_index(commands: Sequence[SetupCommand], prompt: str) -> Optional[int]:
+    if not commands:
+        print("No setup commands configured.")
+        input("Press Enter.")
+        return None
+    raw = input(prompt).strip()
+    try:
+        index = int(raw) - 1
+    except ValueError:
+        print("Invalid command number.")
+        input("Press Enter.")
+        return None
+    if index < 0 or index >= len(commands):
+        print("Invalid command number.")
+        input("Press Enter.")
+        return None
+    return index
+
+
+def _ui_appearance(
+    env: Mapping[str, str],
+) -> Tuple[ThemePalette, bool, bool]:
+    decorated = sys.stdout.isatty()
+    color_enabled = (
+        decorated
+        and "NO_COLOR" not in env
+        and env.get("TERM", "") != "dumb"
+    )
+    settings = load_theme_settings(env)
+    appearance = query_terminal_appearance() if decorated and settings.auto_switch else None
+    return resolve_theme_palette(settings, appearance=appearance), decorated, color_enabled
+
+
+def _ui_width(columns: int) -> int:
+    return max(28, min(columns, 96))
+
+
+def _section_heading(
+    title: str,
+    summary: str,
+    width: int,
+    palette: ThemePalette,
+    *,
+    color_enabled: bool,
+) -> str:
+    return _flat_line(
+        [
+            StyledSegment(title.upper(), "accent", bold=True),
+            StyledSegment("  "),
+            StyledSegment(summary, "muted"),
+        ],
+        width,
+        palette,
+        color_enabled=color_enabled,
+    )
+
+
+def _limited_count(total: int, limit: int) -> Optional[str]:
+    remaining = total - limit
+    return f"… {remaining} more" if remaining > 0 else None
+
+
+def _render_setup_rows(
+    commands: Sequence[SetupCommand],
+    width: int,
+    palette: ThemePalette,
+    *,
+    color_enabled: bool,
+    limit: int,
+) -> List[str]:
+    if not commands:
+        return [
+            _flat_line(
+                [StyledSegment("No setup commands configured.", "subtle", dim=True)],
+                width,
+                palette,
+                color_enabled=color_enabled,
+            )
+        ]
+    lines: List[str] = []
+    compact = width < 58
+    for index, command in enumerate(commands[:limit], 1):
+        command_line = shlex.join(command.argv)
+        lines.append(
+            _flat_line(
+                [
+                    StyledSegment(f"{index:>2}  ", "subtle"),
+                    StyledSegment(command.name, "text", bold=True),
+                ],
+                width,
+                palette,
+                color_enabled=color_enabled,
+            )
+        )
+        metadata = command_line if compact else f"{command_line}  ·  {command.timeout_seconds}s timeout"
+        lines.append(
+            _flat_line(
+                [StyledSegment(f"    {metadata}", "muted", dim=True)],
+                width,
+                palette,
+                color_enabled=color_enabled,
+            )
+        )
+        if compact:
+            lines.append(
+                _flat_line(
+                    [StyledSegment(f"    timeout {command.timeout_seconds}s", "subtle", dim=True)],
+                    width,
+                    palette,
+                    color_enabled=color_enabled,
+                )
+            )
+    remaining = _limited_count(len(commands), limit)
+    if remaining:
+        lines.append(
+            _flat_line(
+                [StyledSegment(remaining, "subtle", dim=True)],
+                width,
+                palette,
+                color_enabled=color_enabled,
+            )
+        )
+    return lines
+
+
+def render_setup_management_screen(
+    context: RepositoryContext,
+    commands: Sequence[SetupCommand],
+    palette: ThemePalette,
+    *,
+    columns: int,
+    rows: int,
+    decorated: bool,
+    color_enabled: bool,
+    notice: Optional[Tuple[str, str]] = None,
+) -> List[str]:
+    width = _ui_width(columns)
+    command_limit = max(1, min(6, (rows - 14) // 2))
+    lines = [
+        "",
+        _flat_line(
+            [
+                StyledSegment("◆ ", "accent", bold=True),
+                StyledSegment("Worktree bootstrap", "text", bold=True),
+                StyledSegment("  /  Setup", "muted"),
+            ],
+            width,
+            palette,
+            color_enabled=color_enabled,
+        ),
+        _flat_line(
+            [
+                StyledSegment("Primary  ", "subtle"),
+                StyledSegment(_friendly_path(context.source), "muted"),
+            ],
+            width,
+            palette,
+            color_enabled=color_enabled,
+        ),
+        "",
+        _section_heading(
+            "Automation",
+            f"{len(commands)} command{'s' if len(commands) != 1 else ''}",
+            width,
+            palette,
+            color_enabled=color_enabled,
+        ),
+    ]
+    lines.extend(
+        _render_setup_rows(
+            commands,
+            width,
+            palette,
+            color_enabled=color_enabled,
+            limit=command_limit,
+        )
+    )
+    if not commands:
+        lines.append(
+            _flat_line(
+                [StyledSegment("Runs after local files are copied into a new worktree.", "subtle", dim=True)],
+                width,
+                palette,
+                color_enabled=color_enabled,
+            )
+        )
+    if notice:
+        lines.extend(
+            [
+                "",
+                _flat_line(
+                    [StyledSegment(notice[0], notice[1], bold=notice[1] in ("positive", "danger"))],
+                    width,
+                    palette,
+                    color_enabled=color_enabled,
+                ),
+            ]
+        )
+    lines.extend(["", _flat_separator(width, palette, color_enabled=color_enabled)])
+    actions: List[ActionSpec] = [
+        ("N", "New", "accent"),
+        ("E", "Edit", "accent"),
+        ("X", "Delete", "danger"),
+        ("U", "Up", "accent"),
+        ("J", "Down", "accent"),
+        ("R", "Run now", "positive"),
+        ("K", "Remove file", "warning"),
+        ("Q", "Back", "accent"),
+    ]
+    lines.extend(_render_action_rows(actions, width, palette, color_enabled=color_enabled))
+    lines.append("")
+    return lines
+
+
+_MANAGE_KEY_ALIASES: Mapping[str, str] = {
+    "ㅁ": "a",
+    "ㅇ": "d",
+    "ㅊ": "c",
+    "ㄴ": "s",
+    "ㅅ": "t",
+    "ㅍ": "v",
+    "ㄱ": "r",
+    "ㅂ": "q",
+    "ㅜ": "n",
+    "ㄷ": "e",
+    "ㅌ": "x",
+    "ㅕ": "u",
+    "ㅓ": "j",
+    "ㅏ": "k",
+    "ㅛ": "y",
+}
+
+
+def normalize_manage_choice(value: str) -> str:
+    choice = value.strip().casefold()
+    return _MANAGE_KEY_ALIASES.get(choice, choice)
+
+
+def _read_manage_choice(*, single_key_mode: bool, prompt: str = "Select › ") -> str:
+    if single_key_mode:
+        try:
+            return normalize_manage_choice(read_single_key())
+        except (OSError, ValueError, AttributeError):
+            pass
+    return normalize_manage_choice(input(prompt))
+
+
+def _confirm_manage_action(prompt: str, *, single_key_mode: bool) -> bool:
+    if single_key_mode:
+        print(prompt, end="", flush=True)
+        try:
+            choice = normalize_manage_choice(read_single_key())
+        except (OSError, ValueError, AttributeError):
+            choice = normalize_manage_choice(input())
+        else:
+            print()
+        return choice == "y"
+    return normalize_manage_choice(input(prompt)) == "y"
+
+
+def _show_manage_form(
+    title: str,
+    hint: str,
+    palette: ThemePalette,
+    *,
+    columns: int,
+    color_enabled: bool,
+) -> None:
+    width = _ui_width(columns)
+    _clear_screen()
+    print()
+    print(
+        _flat_line(
+            [
+                StyledSegment("◆ ", "accent", bold=True),
+                StyledSegment(title, "text", bold=True),
+            ],
+            width,
+            palette,
+            color_enabled=color_enabled,
+        )
+    )
+    print(
+        _flat_line(
+            [StyledSegment(hint, "muted", dim=True)],
+            width,
+            palette,
+            color_enabled=color_enabled,
+        )
+    )
+    print()
+
+
+def _show_setup_choices(
+    commands: Sequence[SetupCommand],
+    palette: ThemePalette,
+    *,
+    columns: int,
+    color_enabled: bool,
+) -> None:
+    width = _ui_width(columns)
+    for index, command in enumerate(commands, 1):
+        print(
+            _flat_line(
+                [
+                    StyledSegment(f"{index:>2}  ", "subtle"),
+                    StyledSegment(command.name, "text", bold=True),
+                    StyledSegment(f"  {shlex.join(command.argv)}", "muted", dim=True),
+                ],
+                width,
+                palette,
+                color_enabled=color_enabled,
+            )
+        )
+    if commands:
+        print()
+
+
+def manage_setup_commands(
+    context: RepositoryContext,
+    state_dir: Path,
+    commands: Sequence[SetupCommand],
+    *,
+    env: Optional[Mapping[str, str]] = None,
+) -> int:
+    effective_env = os.environ if env is None else env
+    palette, decorated, color_enabled = _ui_appearance(effective_env)
+    single_key_mode = decorated and sys.stdin.isatty()
+    current = list(commands)
+    notice: Optional[Tuple[str, str]] = None
+    while True:
+        terminal_size = shutil.get_terminal_size((80, 24))
+        _clear_screen()
+        for line in render_setup_management_screen(
+            context,
+            current,
+            palette,
+            columns=terminal_size.columns,
+            rows=terminal_size.lines,
+            decorated=decorated,
+            color_enabled=color_enabled,
+            notice=notice,
+        ):
+            print(line)
+        notice = None
+        try:
+            choice = _read_manage_choice(single_key_mode=single_key_mode)
+        except EOFError:
+            return 0
+        if choice == "q":
+            return 0
+        if choice == "":
+            continue
+        if choice == "n":
+            try:
+                _show_manage_form(
+                    "New setup command",
+                    "Commands run without a shell in the target worktree.",
+                    palette,
+                    columns=terminal_size.columns,
+                    color_enabled=color_enabled,
+                )
+                command = _prompt_setup_command()
+                write_setup_commands(context, [*current, command])
+                current.append(command)
+                notice = (f"✓ Added {command.name}", "positive")
+            except BootstrapError as exc:
+                notice = (f"Could not save: {exc}", "danger")
+            continue
+        if choice == "e":
+            _show_manage_form(
+                "Edit setup command",
+                "Choose the command number, then keep or replace each value.",
+                palette,
+                columns=terminal_size.columns,
+                color_enabled=color_enabled,
+            )
+            _show_setup_choices(
+                current,
+                palette,
+                columns=terminal_size.columns,
+                color_enabled=color_enabled,
+            )
+            index = _prompt_setup_index(current, "Command number to edit: ")
+            if index is None:
+                continue
+            try:
+                command = _prompt_setup_command(current[index])
+                updated = current[:index] + [command] + current[index + 1:]
+                write_setup_commands(context, updated)
+                current = updated
+                notice = (f"✓ Updated {command.name}", "positive")
+            except BootstrapError as exc:
+                notice = (f"Could not save: {exc}", "danger")
+            continue
+        if choice == "x":
+            _show_manage_form(
+                "Delete setup command",
+                "Choose one saved command. The JSON file is updated atomically.",
+                palette,
+                columns=terminal_size.columns,
+                color_enabled=color_enabled,
+            )
+            _show_setup_choices(
+                current,
+                palette,
+                columns=terminal_size.columns,
+                color_enabled=color_enabled,
+            )
+            index = _prompt_setup_index(current, "Command number to delete: ")
+            if index is None:
+                continue
+            command = current[index]
+            if not _confirm_manage_action(
+                f"Delete '{command.name}'? [y/N] ",
+                single_key_mode=single_key_mode,
+            ):
+                notice = ("Nothing changed.", "subtle")
+                continue
+            updated = current[:index] + current[index + 1:]
+            write_setup_commands(context, updated)
+            current = updated
+            notice = (f"✓ Deleted {command.name}", "positive")
+            continue
+        if choice in ("u", "j"):
+            _show_manage_form(
+                "Reorder setup commands",
+                "Commands run from top to bottom and stop at the first failure.",
+                palette,
+                columns=terminal_size.columns,
+                color_enabled=color_enabled,
+            )
+            _show_setup_choices(
+                current,
+                palette,
+                columns=terminal_size.columns,
+                color_enabled=color_enabled,
+            )
+            index = _prompt_setup_index(current, "Command number to move: ")
+            if index is None:
+                continue
+            destination = index - 1 if choice == "u" else index + 1
+            if destination < 0 or destination >= len(current):
+                notice = ("Command is already at that edge.", "warning")
+                continue
+            updated = current[:]
+            updated[index], updated[destination] = updated[destination], updated[index]
+            write_setup_commands(context, updated)
+            current = updated
+            notice = ("✓ Saved the new command order", "positive")
+            continue
+        if choice == "r":
+            try:
+                result = execute_action("setup", context, state_dir)
+                count = result.get("setup_completed_count", 0)
+                notice = (f"✓ Completed {count} setup command(s)", "positive")
+            except (BootstrapError, NothingToDo) as exc:
+                notice = (str(exc), "warning")
+            continue
+        if choice == "k":
+            if not (context.source / SETUP_FILE).exists():
+                notice = ("Setup configuration does not exist.", "warning")
+                continue
+            if not _confirm_manage_action(
+                "Remove the setup configuration? [y/N] ",
+                single_key_mode=single_key_mode,
+            ):
+                notice = ("Nothing changed.", "subtle")
+                continue
+            remove_setup_configuration(context)
+            current = []
+            notice = ("✓ Removed .herdr/worktree-setup.json", "positive")
+            continue
+        notice = ("Unknown key. Choose one of the actions below.", "warning")
+
+
 def _direct_root_items(context: RepositoryContext, included: Sequence[str]) -> List[Tuple[str, str]]:
     included_set = set(included)
     rows: List[Tuple[str, str]] = []
@@ -2387,53 +2941,357 @@ def _direct_root_items(context: RepositoryContext, included: Sequence[str]) -> L
     return rows
 
 
+def render_management_screen(
+    context: RepositoryContext,
+    paths: Sequence[str],
+    statuses: Sequence[CopyEntryStatus],
+    commands: Sequence[SetupCommand],
+    root_items: Sequence[Tuple[str, str]],
+    palette: ThemePalette,
+    *,
+    columns: int,
+    rows: int,
+    decorated: bool,
+    color_enabled: bool,
+    details_visible: bool = False,
+    notice: Optional[Tuple[str, str]] = None,
+) -> List[str]:
+    width = _ui_width(columns)
+    addable = [name for name, label in root_items if label == "can add/ignored"]
+    tracked = sum(label == "cannot add/tracked" for _name, label in root_items)
+    unignored = sum(label == "cannot add/unignored" for _name, label in root_items)
+    copy_limit = max(1, min(4, rows - (21 if details_visible else 15)))
+    setup_limit = max(1, min(3, (rows - 16) // 2))
+    checkout_status = "PRIMARY CHECKOUT" if context.target_is_primary else "WORKTREE"
+    checkout_role = "info" if context.target_is_primary else "positive"
+    lines = [
+        "",
+        _flat_line(
+            [
+                StyledSegment("◆ ", "accent", bold=True),
+                StyledSegment("Worktree bootstrap", "text", bold=True),
+                StyledSegment("  "),
+                StyledSegment(checkout_status, checkout_role, bold=True),
+            ],
+            width,
+            palette,
+            color_enabled=color_enabled,
+        ),
+        _flat_line(
+            [
+                StyledSegment("Primary  ", "subtle"),
+                StyledSegment(_friendly_path(context.source), "muted"),
+            ],
+            width,
+            palette,
+            color_enabled=color_enabled,
+        ),
+    ]
+    if context.target != context.source:
+        lines.append(
+            _flat_line(
+                [
+                    StyledSegment("Target   ", "subtle"),
+                    StyledSegment(_friendly_path(context.target), "muted"),
+                ],
+                width,
+                palette,
+                color_enabled=color_enabled,
+            )
+        )
+
+    lines.extend(
+        [
+            "",
+            _section_heading(
+                "Copy plan",
+                f"{len(paths)} selected  ·  {len(addable)} available",
+                width,
+                palette,
+                color_enabled=color_enabled,
+            ),
+        ]
+    )
+    if not paths:
+        lines.append(
+            _flat_line(
+                [StyledSegment("No local files selected.", "subtle", dim=True)],
+                width,
+                palette,
+                color_enabled=color_enabled,
+            )
+        )
+    else:
+        for index, status_value in enumerate(statuses[:copy_limit], 1):
+            target_label = "target present" if status_value.target_exists else "new target"
+            target_role = "positive" if status_value.target_exists else "info"
+            lines.append(
+                _flat_line(
+                    [
+                        StyledSegment(f"{index:>2}  ", "subtle"),
+                        StyledSegment(status_value.path, "text", bold=True),
+                        StyledSegment("  ·  ", "subtle"),
+                        StyledSegment(target_label, target_role),
+                    ],
+                    width,
+                    palette,
+                    color_enabled=color_enabled,
+                )
+            )
+        remaining = _limited_count(len(statuses), copy_limit)
+        if remaining:
+            lines.append(
+                _flat_line(
+                    [StyledSegment(remaining, "subtle", dim=True)],
+                    width,
+                    palette,
+                    color_enabled=color_enabled,
+                )
+            )
+    if addable:
+        preview = ", ".join(addable[:3])
+        if len(addable) > 3:
+            preview += f", +{len(addable) - 3}"
+        lines.append(
+            _flat_line(
+                [
+                    StyledSegment("+ ", "positive", bold=True),
+                    StyledSegment(preview, "muted"),
+                ],
+                width,
+                palette,
+                color_enabled=color_enabled,
+            )
+        )
+
+    lines.extend(
+        [
+            "",
+            _section_heading(
+                "Setup",
+                f"{len(commands)} command{'s' if len(commands) != 1 else ''}",
+                width,
+                palette,
+                color_enabled=color_enabled,
+            ),
+        ]
+    )
+    lines.extend(
+        _render_setup_rows(
+            commands,
+            width,
+            palette,
+            color_enabled=color_enabled,
+            limit=setup_limit,
+        )
+    )
+
+    if details_visible:
+        lines.extend(
+            [
+                "",
+                _section_heading(
+                    "Repository paths",
+                    f"{tracked} tracked  ·  {unignored} unignored",
+                    width,
+                    palette,
+                    color_enabled=color_enabled,
+                ),
+            ]
+        )
+        detail_rows = [item for item in root_items if item[1] in ("included", "can add/ignored")]
+        detail_limit = max(1, min(5, rows - len(lines) - 5))
+        if not detail_rows:
+            lines.append(
+                _flat_line(
+                    [StyledSegment("No eligible root paths.", "subtle", dim=True)],
+                    width,
+                    palette,
+                    color_enabled=color_enabled,
+                )
+            )
+        for name, label in detail_rows[:detail_limit]:
+            included = label == "included"
+            lines.append(
+                _flat_line(
+                    [
+                        StyledSegment("✓ " if included else "+ ", "accent" if included else "positive", bold=True),
+                        StyledSegment(name, "text"),
+                        StyledSegment("  included" if included else "  ignored · available", "muted", dim=True),
+                    ],
+                    width,
+                    palette,
+                    color_enabled=color_enabled,
+                )
+            )
+        remaining = _limited_count(len(detail_rows), detail_limit)
+        if remaining:
+            lines.append(
+                _flat_line(
+                    [StyledSegment(remaining, "subtle", dim=True)],
+                    width,
+                    palette,
+                    color_enabled=color_enabled,
+                )
+            )
+
+    if notice:
+        lines.extend(
+            [
+                "",
+                _flat_line(
+                    [StyledSegment(notice[0], notice[1], bold=notice[1] in ("positive", "danger"))],
+                    width,
+                    palette,
+                    color_enabled=color_enabled,
+                ),
+            ]
+        )
+    lines.extend(["", _flat_separator(width, palette, color_enabled=color_enabled)])
+    actions: List[ActionSpec] = [
+        ("A", "Add", "accent"),
+        ("D", "Remove", "danger"),
+        ("C", "Setup", "accent"),
+        ("S", "Sync", "positive"),
+        ("T", "Status", "info"),
+        ("V", "Hide paths" if details_visible else "Paths", "accent"),
+        ("Q", "Close", "accent"),
+    ]
+    lines.extend(_render_action_rows(actions, width, palette, color_enabled=color_enabled))
+    lines.append("")
+    return lines
+
+
+def render_status_screen(
+    status: Sequence[str],
+    palette: ThemePalette,
+    *,
+    columns: int,
+    color_enabled: bool,
+) -> List[str]:
+    width = _ui_width(columns)
+    lines = [
+        "",
+        _flat_line(
+            [
+                StyledSegment("◆ ", "accent", bold=True),
+                StyledSegment("Worktree bootstrap", "text", bold=True),
+                StyledSegment("  /  Status", "muted"),
+            ],
+            width,
+            palette,
+            color_enabled=color_enabled,
+        ),
+        "",
+    ]
+    for value in status:
+        if ":" in value:
+            label, detail = value.split(":", 1)
+            lines.append(
+                _flat_line(
+                    [
+                        StyledSegment(f"{label:<16}", "subtle"),
+                        StyledSegment(detail.strip(), "text"),
+                    ],
+                    width,
+                    palette,
+                    color_enabled=color_enabled,
+                )
+            )
+        else:
+            lines.append(
+                _flat_line(
+                    [StyledSegment(value, "text")],
+                    width,
+                    palette,
+                    color_enabled=color_enabled,
+                )
+            )
+    lines.extend(
+        [
+            "",
+            _flat_separator(width, palette, color_enabled=color_enabled),
+            _flat_line(
+                [StyledSegment("ANY KEY", "accent", bold=True), StyledSegment(" Back")],
+                width,
+                palette,
+                color_enabled=color_enabled,
+            ),
+            "",
+        ]
+    )
+    return lines
+
+
 def _clear_screen() -> None:
     if sys.stdout.isatty():
         print("\033[2J\033[H", end="")
 
 
-def manage(context: RepositoryContext, state_dir: Path) -> int:
+def manage(
+    context: RepositoryContext,
+    state_dir: Path,
+    *,
+    env: Optional[Mapping[str, str]] = None,
+) -> int:
+    effective_env = os.environ if env is None else env
+    palette, decorated, color_enabled = _ui_appearance(effective_env)
+    single_key_mode = decorated and sys.stdin.isatty()
+    details_visible = False
+    notice: Optional[Tuple[str, str]] = None
     if (context.source / SETUP_FILE).exists():
         ensure_control_excluded(context, SETUP_FILE)
     while True:
+        terminal_size = shutil.get_terminal_size((80, 24))
         _clear_screen()
         try:
             paths = read_copy_list(context.source)
             root_items = _direct_root_items(context, paths)
             commands = load_setup_commands(context.source)
+            statuses = classify_copy_entries(context.source, context.target, paths)
         except BootstrapError as exc:
             print(f"Configuration error: {exc}")
             print("Edit the affected control file, then press Enter to refresh or q to quit.")
-            choice = input("> ").strip().lower()
+            choice = normalize_manage_choice(input("> "))
             if choice == "q":
                 return 1
             continue
 
-        print("Herdr Worktree Bootstrap")
-        print(f"Primary checkout: {context.source}")
-        print(f"Current target:   {context.target}")
-        print("\nCopy list:")
-        if paths:
-            for index, path in enumerate(paths, 1):
-                print(f"  {index:>2}. {path}")
-        else:
-            print("  (empty)")
-        print("\nRepository root (not recursively scanned):")
-        for name, label in root_items:
-            print(f"  [{label}] {name}")
-        print("\nSetup commands (read-only; edit .herdr/worktree-setup.json):")
-        if commands:
-            for command in commands:
-                print(f"  {command.name}: {list(command.argv)!r} ({command.timeout_seconds}s)")
-        else:
-            print("  (none)")
-        print("\n[a] add path  [d] delete path  [s] sync now  [t] status  [r] refresh  [q] quit")
-        choice = input("> ").strip().lower()
+        for line in render_management_screen(
+            context,
+            paths,
+            statuses,
+            commands,
+            root_items,
+            palette,
+            columns=terminal_size.columns,
+            rows=terminal_size.lines,
+            decorated=decorated,
+            color_enabled=color_enabled,
+            details_visible=details_visible,
+            notice=notice,
+        ):
+            print(line)
+        notice = None
+        try:
+            choice = _read_manage_choice(single_key_mode=single_key_mode)
+        except EOFError:
+            return 0
         if choice == "q":
             return 0
         if choice in ("", "r"):
             continue
+        if choice == "v":
+            details_visible = not details_visible
+            continue
         if choice == "a":
+            _show_manage_form(
+                "Add a local path",
+                "Enter a repository-relative ignored path from the primary checkout.",
+                palette,
+                columns=terminal_size.columns,
+                color_enabled=color_enabled,
+            )
             candidate = input("Repository-relative path: ").strip()
             try:
                 candidate = validate_relative_path(candidate)
@@ -2445,40 +3303,63 @@ def manage(context: RepositoryContext, state_dir: Path) -> int:
                 if status_value.eligibility != "ignored":
                     raise BootstrapError(status_value.detail)
                 write_copy_list(context, [*paths, candidate])
-                print(f"Added {candidate}. Press Enter.")
+                notice = (f"✓ Added {candidate} to the copy plan", "positive")
             except BootstrapError as exc:
-                print(f"Not added: {exc}. Press Enter.")
-            input()
+                notice = (f"Could not add path: {exc}", "danger")
             continue
         if choice == "d":
+            if not paths:
+                notice = ("The copy plan is already empty.", "warning")
+                continue
+            _show_manage_form(
+                "Remove a local path",
+                "Choose an entry from the copy plan. Source files are never deleted.",
+                palette,
+                columns=terminal_size.columns,
+                color_enabled=color_enabled,
+            )
+            for index, path in enumerate(paths, 1):
+                print(f"  {index:>2}. {path}")
+            print()
             raw_index = input("Entry number to delete: ").strip()
             try:
                 index = int(raw_index) - 1
                 if index < 0 or index >= len(paths):
                     raise ValueError
             except ValueError:
-                print("Invalid entry number. Press Enter.")
-                input()
+                notice = ("Invalid copy-plan entry number.", "warning")
                 continue
             removed = paths[index]
             write_copy_list(context, paths[:index] + paths[index + 1 :])
-            print(f"Removed {removed}. Press Enter.")
-            input()
+            notice = (f"✓ Removed {removed} from the copy plan", "positive")
+            continue
+        if choice == "c":
+            manage_setup_commands(context, state_dir, commands, env=effective_env)
             continue
         if choice == "s":
             try:
-                execute_action("sync", context, state_dir)
+                result = execute_action("sync", context, state_dir)
+                count = result.get("copied_count", 0)
+                notice = (f"✓ Synced {count} item(s)", "positive")
             except (BootstrapError, NothingToDo) as exc:
-                print(exc)
-            print("Press Enter.")
-            input()
+                notice = (str(exc), "warning")
             continue
         if choice == "t":
             lines, _ = status_lines(context, state_dir)
-            print("\n" + "\n".join(lines))
-            print("\nPress Enter.")
-            input()
+            _clear_screen()
+            for line in render_status_screen(
+                lines,
+                palette,
+                columns=terminal_size.columns,
+                color_enabled=color_enabled,
+            ):
+                print(line)
+            try:
+                _read_manage_choice(single_key_mode=single_key_mode, prompt="Press Enter to return: ")
+            except EOFError:
+                return 0
             continue
+        notice = ("Unknown key. Choose one of the actions below.", "warning")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2491,6 +3372,7 @@ def build_parser() -> argparse.ArgumentParser:
             "setup",
             "status",
             "manage",
+            "setup-manage",
             "branch-cleanup-event",
             "branch-cleanup",
         ),
@@ -2518,7 +3400,16 @@ def main(argv: Optional[Sequence[str]] = None, env: Optional[Mapping[str, str]] 
             print("\n".join(lines))
             return 2 if invalid else 0
         if args.action == "manage":
-            return manage(context, state_dir)
+            return manage(context, state_dir, env=effective_env)
+        if args.action == "setup-manage":
+            if (context.source / SETUP_FILE).exists():
+                ensure_control_excluded(context, SETUP_FILE)
+            return manage_setup_commands(
+                context,
+                state_dir,
+                load_setup_commands(context.source),
+                env=effective_env,
+            )
         if args.action == "bootstrap":
             record_worktree_mapping(context, state_dir)
         execute_action(args.action, context, state_dir)

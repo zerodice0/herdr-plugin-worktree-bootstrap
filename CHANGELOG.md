@@ -2,6 +2,27 @@
 
 All notable changes to this project are documented here.
 
+## [0.3.2] - 2026-08-02
+
+- Bound the main management popup to 96 columns by 24 rows instead of scaling it as a percentage of very large clients.
+- Bound the direct setup editor to a compact 84 columns by 20 rows.
+- Preserve Herdr's available-area handling for clients smaller than the requested fixed-cell dimensions.
+
+## [0.3.1] - 2026-08-02
+
+- Redesign the management popup as a compact, theme-aware dashboard with clearer copy and setup sections.
+- Hide low-value tracked and unignored path rows by default while preserving counts and an opt-in eligible-path view.
+- Make dashboard and setup-editor actions single-key, with responsive action wrapping and persistent inline notices.
+- Add a direct `configure-setup` Herdr action and pane entrypoint.
+- Document an optional Herdr-native `prefix+b` shortcut and live configuration reload.
+
+## [0.3.0] - 2026-08-01
+
+- Add a setup command editor to the management popup.
+- Support adding, editing, deleting, reordering, and manually running setup commands without editing JSON by hand.
+- Parse quoted command lines into argv arrays without invoking a shell or expanding environment variables.
+- Atomically save validated setup configuration and require confirmation before removing it.
+
 ## [0.2.3] - 2026-07-31
 
 - Keep the cleanup action footer on one line whenever its measured display width fits.

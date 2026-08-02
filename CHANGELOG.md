@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## [0.3.1] - 2026-08-02
+
+- Redesign the management popup as a compact, theme-aware dashboard with clearer copy and setup sections.
+- Hide low-value tracked and unignored path rows by default while preserving counts and an opt-in eligible-path view.
+- Make dashboard and setup-editor actions single-key, with responsive action wrapping and persistent inline notices.
+- Add a direct `configure-setup` Herdr action and pane entrypoint.
+- Document an optional Herdr-native `prefix+b` shortcut and live configuration reload.
+
 ## [0.3.0] - 2026-08-01
 
 - Add a setup command editor to the management popup.

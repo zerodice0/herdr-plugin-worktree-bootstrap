@@ -324,6 +324,84 @@ accent = "cyan"
         self.assertEqual(plugin.normalize_cleanup_choice("ㅂ"), "q")
         self.assertEqual(plugin.normalize_cleanup_choice("ㅏ"), "k")
 
+    def test_management_dashboard_hides_low_value_blocked_paths_by_default(self):
+        palette = plugin.resolve_theme_palette(plugin.ThemeSettings(name="tokyo-night"))
+        context = plugin.RepositoryContext(
+            target=Path("/tmp/repo-worktree"),
+            source=Path("/tmp/repo"),
+            common_git_dir=Path("/tmp/repo/.git"),
+            target_is_primary=False,
+        )
+        statuses = [
+            plugin.CopyEntryStatus(".env", True, False, "ignored", "eligible"),
+        ]
+        lines = plugin.render_management_screen(
+            context,
+            [".env"],
+            statuses,
+            [plugin.SetupCommand("Install dependencies", ("npm", "ci"), 900)],
+            [
+                (".env", "included"),
+                (".cache", "can add/ignored"),
+                ("README.md", "cannot add/tracked"),
+                ("notes.txt", "cannot add/unignored"),
+            ],
+            palette,
+            columns=96,
+            rows=28,
+            decorated=True,
+            color_enabled=False,
+        )
+        rendered = "\n".join(lines)
+        self.assertIn("COPY PLAN  1 selected  ·  1 available", rendered)
+        self.assertIn("SETUP  1 command", rendered)
+        self.assertIn("A Add    D Remove    C Setup", rendered)
+        self.assertNotIn("README.md", rendered)
+        self.assertNotIn("notes.txt", rendered)
+        self.assertNotIn("╭", rendered)
+        self.assertNotIn("│", rendered)
+
+    def test_management_dashboard_is_responsive_and_details_are_opt_in(self):
+        palette = plugin.resolve_theme_palette(plugin.ThemeSettings(name="tokyo-night"))
+        context = plugin.RepositoryContext(
+            target=Path("/tmp/repo"),
+            source=Path("/tmp/repo"),
+            common_git_dir=Path("/tmp/repo/.git"),
+            target_is_primary=True,
+        )
+        lines = plugin.render_management_screen(
+            context,
+            [],
+            [],
+            [],
+            [
+                (".cache", "can add/ignored"),
+                ("README.md", "cannot add/tracked"),
+            ],
+            palette,
+            columns=48,
+            rows=20,
+            decorated=True,
+            color_enabled=False,
+            details_visible=True,
+        )
+        rendered = "\n".join(lines)
+        self.assertIn("REPOSITORY PATHS  1 tracked", rendered)
+        self.assertIn(".cache", rendered)
+        self.assertNotIn("README.md", rendered)
+        self.assertIn("V Hide paths", rendered)
+        for line in lines:
+            self.assertLessEqual(plugin._display_width(line), 48)
+
+    def test_management_choices_support_single_keys_and_korean_layout(self):
+        self.assertEqual(plugin.normalize_manage_choice("ㅊ"), "c")
+        self.assertEqual(plugin.normalize_manage_choice("ㅍ"), "v")
+        self.assertEqual(plugin.normalize_manage_choice("ㅛ"), "y")
+        with mock.patch.object(plugin, "read_single_key", return_value="C"):
+            with mock.patch("builtins.input") as line_input:
+                self.assertEqual(plugin._read_manage_choice(single_key_mode=True), "c")
+        line_input.assert_not_called()
+
 
 class GitRepositoryTestCase(unittest.TestCase):
     def setUp(self):
@@ -681,6 +759,12 @@ class SetupBehaviorTests(GitRepositoryTestCase):
 
 
 class StateAndManagementTests(GitRepositoryTestCase):
+    def test_setup_management_has_a_direct_cli_entrypoint(self):
+        self.assertEqual(
+            plugin.build_parser().parse_args(["setup-manage"]).action,
+            "setup-manage",
+        )
+
     def test_target_lock_rejects_concurrent_operation(self):
         key = plugin.target_key(self.context)
         with plugin.TargetLock(self.state_dir, key):

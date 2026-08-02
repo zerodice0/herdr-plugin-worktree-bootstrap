@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## [0.3.2] - 2026-08-02
+
+- Bound the main management popup to 96 columns by 24 rows instead of scaling it as a percentage of very large clients.
+- Bound the direct setup editor to a compact 84 columns by 20 rows.
+- Preserve Herdr's available-area handling for clients smaller than the requested fixed-cell dimensions.
+
 ## [0.3.1] - 2026-08-02
 
 - Redesign the management popup as a compact, theme-aware dashboard with clearer copy and setup sections.

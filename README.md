@@ -18,7 +18,7 @@ The plugin supports Herdr 0.7.0 or newer on Linux and macOS. It requires Python 
 Install the tagged release from GitHub:
 
 ```sh
-herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.3.1
+herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.3.2
 ```
 
 For local development, link this checkout:
@@ -106,7 +106,7 @@ herdr plugin action invoke zerodice0.worktree-bootstrap.configure-setup
 herdr plugin action invoke zerodice0.worktree-bootstrap.review-branch-cleanup
 ```
 
-The management popup follows the active Herdr theme and uses the Herdr popup frame as its only border. Its default dashboard shows the selected copy plan, eligible ignored-path suggestions, and setup commands without filling the screen with tracked files. Press `v` to reveal eligible root paths and blocked-path counts. The footer stays on one line when it fits and wraps only at complete action boundaries on narrower terminals.
+The management popup follows the active Herdr theme and uses the Herdr popup frame as its only border. It uses a bounded 96-column by 24-row popup instead of scaling indefinitely with large terminals; Herdr constrains fixed-cell popups to the available client area on smaller screens. The direct setup editor uses a smaller 84-column by 20-row popup. The default dashboard shows the selected copy plan, eligible ignored-path suggestions, and setup commands without filling the screen with tracked files. Press `v` to reveal eligible root paths and blocked-path counts. The footer stays on one line when it fits and wraps only at complete action boundaries on narrower terminals.
 
 The popup scans only direct children of the repository root. To add a nested path, press `a` and type its repository-relative path; ignored directories are not recursively walked. Dashboard choices use a single key without Enter. Text fields, path input, command input, and numbered selections still use Enter because they accept multi-character values.
 
@@ -214,7 +214,7 @@ Before validation, find and disable the old plugin:
 ```sh
 herdr plugin list
 herdr plugin disable OLD_PLUGIN_ID
-herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.3.1
+herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.3.2
 ```
 
 To roll back, disable this plugin and re-enable the previous one. Control files are left untouched:

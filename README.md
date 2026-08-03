@@ -11,14 +11,14 @@ It is deliberately conservative:
 - branch retention is the default, safe deletion uses `git branch -d`, and force deletion requires typing the exact branch name;
 - there is no ecosystem detection and no automatic selection of dependency or build output directories.
 
-The plugin supports Herdr 0.7.0 or newer on Linux and macOS. It requires Python 3.9 or newer and uses only the Python standard library. It does not require `jq` or third-party Python packages.
+The plugin supports Herdr 0.7.0 or newer on Linux and macOS. It requires Python 3.9 or newer and uses only the Python standard library. It does not require `jq` or third-party Python packages. When `fzf` is available, the management popup uses it as an optional multi-select path picker; the typed-path fallback remains available without it.
 
 ## Install
 
 Install the tagged release from GitHub:
 
 ```sh
-herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.3.3
+herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.4.0
 ```
 
 For local development, link this checkout:
@@ -106,11 +106,13 @@ herdr plugin action invoke zerodice0.worktree-bootstrap.configure-setup
 herdr plugin action invoke zerodice0.worktree-bootstrap.review-branch-cleanup
 ```
 
-The management popup follows the active Herdr theme and uses the Herdr popup frame as its only border. It uses a bounded 96-column by 24-row popup instead of scaling indefinitely with large terminals; Herdr constrains fixed-cell popups to the available client area on smaller screens. The direct setup editor uses a smaller 84-column by 20-row popup. The default dashboard shows the selected copy plan, eligible ignored-path suggestions, and setup commands without filling the screen with tracked files. Press `v` to reveal eligible root paths and blocked-path counts. The footer stays on one line when it fits and wraps only at complete action boundaries on narrower terminals.
+The management popup follows the active Herdr theme and uses the Herdr popup frame as its only border. It uses a bounded 96-column by 24-row popup instead of scaling indefinitely with large terminals; Herdr constrains fixed-cell popups to the available client area on smaller screens. The direct setup editor uses a smaller 84-column by 20-row popup. The default dashboard includes every selected copy-plan entry and every setup command without filling the screen with tracked files. When the content exceeds the viewport, a persistent `SCROLL` row shows the visible range, total row count, and position track. Press `j` or Down Arrow to move down and `k` or Up Arrow to move up; Page Up and Page Down move by one viewport. Press `v` to reveal eligible root paths and blocked-path counts. The action footer stays on one line when it fits and wraps only at complete action boundaries on narrower terminals. Navigation redraws are batched in place instead of clearing the terminal between cursor movements.
 
 Management actions check the selected workspace before opening a popup. If it is not a Git repository, the plugin skips the popup and shows a native Herdr notification with an actionable message instead. This avoids a popup that briefly flashes and closes, and follows the current Herdr toast theme and delivery settings. Automated worktree events remain quiet.
 
-The popup scans only direct children of the repository root. To add a nested path, press `a` and type its repository-relative path; ignored directories are not recursively walked. Dashboard choices use a single key without Enter. Text fields, path input, command input, and numbered selections still use Enter because they accept multi-character values.
+Press `a` to select one or more ignored paths with `fzf`. Git supplies the candidates, and wholly ignored directories are collapsed into one row instead of recursively expanding large cache or dependency trees. Inside the picker, use `j`/`k` or Up/Down Arrow to move, Space to toggle multiple paths, Enter to apply, `/` to enter fuzzy-search mode, and Esc to cancel immediately and return to the management screen. Press `d` to open the same picker for currently registered paths; removing an entry stops future copies but never deletes the source file. Press `i` only when an exceptional nested path needs to be typed directly.
+
+The copy plan is opt-in: every path not listed in `.herdr/worktree-copy.list` is already excluded, so there is no separate "do not copy" list. If `fzf` is unavailable, `a` and `d` fall back to the typed path and numbered removal flows. Dashboard choices use a single key without Enter; free-form fields still use Enter because they accept multi-character values.
 
 For a short Herdr-native trigger, add this optional binding to `~/.config/herdr/config.toml`:
 
@@ -137,9 +139,11 @@ Open the management popup and press `c`, or invoke `configure-setup` directly. T
 
 ```text
 [n] new       [e] edit       [x] delete
-[u] move up   [j] move down  [r] run now
-[k] remove configuration    [q] back
+[u] move up   [m] move down  [r] run now
+[z] remove configuration    [q] back
 ```
+
+The setup editor uses the same `j`/`k` and arrow-key scrolling as the main dashboard. Reordering uses `u` and `m` so navigation never changes configuration or opens an input prompt.
 
 When adding or editing a command, enter its display name, one argv command line, and a positive timeout. Quotes are parsed into argv entries; no shell is invoked and environment variables are not expanded. For example, entering `npm ci` stores two argv entries, `npm` and `ci`, while `tool "local data/input.json"` keeps the path as one argument. Each change is validated and atomically saved to `.herdr/worktree-setup.json`; deleting the configuration requires confirmation.
 
@@ -216,7 +220,7 @@ Before validation, find and disable the old plugin:
 ```sh
 herdr plugin list
 herdr plugin disable OLD_PLUGIN_ID
-herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.3.3
+herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.4.0
 ```
 
 To roll back, disable this plugin and re-enable the previous one. Control files are left untouched:

@@ -17,8 +17,8 @@ jobs:
         os: [ubuntu-latest, macos-latest]
         python: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
       - name: Compile
@@ -38,8 +38,8 @@ jobs:
           - os: macos-latest
             asset: herdr-macos-aarch64
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Download Herdr 0.7.5

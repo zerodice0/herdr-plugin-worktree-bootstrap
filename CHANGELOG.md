@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## [0.3.3] - 2026-08-03
+
+- Preflight management actions before opening their Herdr popup.
+- Show a native Herdr notification instead of flashing and immediately closing a popup when the selected workspace is not a Git repository.
+- Normalize non-Git failures into a stable, actionable message instead of exposing locale-dependent `git rev-parse` output.
+
 ## [0.3.2] - 2026-08-02
 
 - Bound the main management popup to 96 columns by 24 rows instead of scaling it as a percentage of very large clients.

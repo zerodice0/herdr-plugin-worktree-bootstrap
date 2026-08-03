@@ -104,6 +104,64 @@ class ContextResolverTests(unittest.TestCase):
             plugin.resolve_target_path(None, {"HERDR_PLUGIN_CONTEXT_JSON": "{"})
 
 
+class ManagementLauncherTests(unittest.TestCase):
+    def test_non_git_repository_has_a_stable_user_facing_reason(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(
+                plugin.NotGitRepository,
+                "this workspace is not a Git repository",
+            ):
+                plugin.resolve_repository(Path(temporary))
+
+    def test_non_git_launcher_notifies_without_opening_a_popup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.object(
+                plugin,
+                "notify_repository_unavailable",
+                return_value=True,
+            ) as notify_mock:
+                with mock.patch.object(plugin, "launch_management_popup") as popup_mock:
+                    result = plugin.launch_management_ui("manage", Path(temporary), {})
+        self.assertEqual(result, 0)
+        popup_mock.assert_not_called()
+        reason = notify_mock.call_args.args[0]
+        self.assertIsInstance(reason, plugin.NotGitRepository)
+
+    def test_notification_uses_the_native_herdr_command(self):
+        completed = subprocess.CompletedProcess([], 0)
+        with mock.patch.object(plugin.subprocess, "run", return_value=completed) as run_mock:
+            shown = plugin.show_herdr_notification(
+                "Worktree Bootstrap unavailable",
+                "This workspace is not a Git repository.",
+                {"HERDR_BIN_PATH": "/usr/local/bin/herdr"},
+            )
+        self.assertTrue(shown)
+        command = run_mock.call_args.args[0]
+        self.assertEqual(command[:3], ["/usr/local/bin/herdr", "notification", "show"])
+        self.assertIn("Worktree Bootstrap unavailable", command)
+        self.assertEqual(command[command.index("--sound") + 1], "none")
+
+    def test_valid_launcher_opens_the_requested_bounded_popup(self):
+        context = plugin.RepositoryContext(
+            target=Path("/tmp/repository"),
+            source=Path("/tmp/repository"),
+            common_git_dir=Path("/tmp/repository/.git"),
+            target_is_primary=True,
+        )
+        completed = subprocess.CompletedProcess([], 0, stdout="{}", stderr="")
+        with mock.patch.object(plugin.subprocess, "run", return_value=completed) as run_mock:
+            plugin.launch_management_popup(
+                "setup-manage",
+                context,
+                {"HERDR_BIN_PATH": "/usr/local/bin/herdr"},
+            )
+        command = run_mock.call_args.args[0]
+        self.assertEqual(command[command.index("--entrypoint") + 1], "setup-manage")
+        self.assertEqual(command[command.index("--width") + 1], "84")
+        self.assertEqual(command[command.index("--height") + 1], "20")
+        self.assertEqual(command[command.index("--cwd") + 1], "/tmp/repository")
+
+
 class ThemeRenderingTests(unittest.TestCase):
     def inspection(self, **overrides):
         values = {

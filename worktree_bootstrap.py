@@ -44,6 +44,8 @@ PROTECTED_BRANCHES = frozenset({"main", "master", "develop", "development", "tru
 ANSI_RESET = "\033[0m"
 MIN_ACTION_FOOTER_COLUMNS = 32
 ACTION_GROUP_GAP = 4
+MANAGE_POPUP_SIZE = ("96", "24")
+SETUP_MANAGE_POPUP_SIZE = ("84", "20")
 ColorValue = Optional[Union[int, Tuple[int, int, int]]]
 ActionSpec = Tuple[str, str, str]
 
@@ -77,6 +79,10 @@ class SetupCommandError(BootstrapError):
 
 class NothingToDo(RuntimeError):
     """A safe no-op condition which should exit successfully."""
+
+
+class NotGitRepository(NothingToDo):
+    """The selected workspace is not backed by a Git repository."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -716,7 +722,10 @@ def resolve_target_path(
 def resolve_repository(target_path: Path) -> RepositoryContext:
     if not target_path.exists():
         raise NothingToDo(f"target checkout is unavailable: {target_path}")
-    if _is_bare(target_path):
+    bare_probe = _run_git(target_path, ["rev-parse", "--is-bare-repository"], check=False)
+    if bare_probe.returncode != 0:
+        raise NotGitRepository("this workspace is not a Git repository")
+    if bare_probe.stdout.strip() == "true":
         raise NothingToDo("bare repositories do not have worktree files to bootstrap")
     target = _git_root(target_path)
     common_git_dir = _git_common_dir(target)
@@ -2050,6 +2059,116 @@ def _herdr_command(env: Mapping[str, str]) -> Optional[str]:
     return shutil.which("herdr")
 
 
+def show_herdr_notification(
+    title: str,
+    body: str,
+    env: Mapping[str, str],
+    *,
+    sound: str = "none",
+) -> bool:
+    herdr = _herdr_command(env)
+    if not herdr:
+        return False
+    try:
+        result = subprocess.run(
+            [
+                herdr,
+                "notification",
+                "show",
+                title,
+                "--body",
+                body,
+                "--sound",
+                sound,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def _repository_unavailable_body(reason: NothingToDo) -> str:
+    if isinstance(reason, NotGitRepository):
+        return "This workspace is not a Git repository. Open a Git-backed workspace and try again."
+    return str(reason).rstrip(".") + "."
+
+
+def notify_repository_unavailable(reason: NothingToDo, env: Mapping[str, str]) -> bool:
+    return show_herdr_notification(
+        "Worktree Bootstrap unavailable",
+        _repository_unavailable_body(reason),
+        env,
+    )
+
+
+def launch_management_popup(
+    entrypoint: str,
+    context: RepositoryContext,
+    env: Mapping[str, str],
+) -> None:
+    sizes = {
+        "manage": MANAGE_POPUP_SIZE,
+        "setup-manage": SETUP_MANAGE_POPUP_SIZE,
+    }
+    if entrypoint not in sizes:
+        raise BootstrapError(f"unknown management entrypoint: {entrypoint}")
+    herdr = _herdr_command(env)
+    if not herdr:
+        raise BootstrapError("herdr is required to open the management popup")
+    width, height = sizes[entrypoint]
+    command = [
+        herdr,
+        "plugin",
+        "pane",
+        "open",
+        "--plugin",
+        PLUGIN_ID,
+        "--entrypoint",
+        entrypoint,
+        "--placement",
+        "popup",
+        "--width",
+        width,
+        "--height",
+        height,
+        "--cwd",
+        os.fspath(context.target),
+        "--focus",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise BootstrapError("could not open the Worktree Bootstrap popup") from exc
+    if result.returncode != 0:
+        raise BootstrapError("could not open the Worktree Bootstrap popup")
+
+
+def launch_management_ui(
+    entrypoint: str,
+    target_path: Path,
+    env: Mapping[str, str],
+) -> int:
+    try:
+        context = resolve_repository(target_path)
+    except NothingToDo as exc:
+        if not notify_repository_unavailable(exc, env):
+            print(_repository_unavailable_body(exc), file=sys.stderr)
+        return 0
+    launch_management_popup(entrypoint, context, env)
+    return 0
+
+
 def launch_branch_cleanup_popup(
     cleanup_id: str,
     branch: str,
@@ -2090,23 +2209,12 @@ def launch_branch_cleanup_popup(
         return False
     if result.returncode == 0:
         return True
-    with contextlib.suppress(OSError, subprocess.TimeoutExpired):
-        subprocess.run(
-            [
-                herdr,
-                "notification",
-                "show",
-                "Branch cleanup pending",
-                "--body",
-                f"Review local branch {branch} from the Worktree Bootstrap action.",
-                "--sound",
-                "request",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-            timeout=5,
-        )
+    show_herdr_notification(
+        "Branch cleanup pending",
+        f"Review local branch {branch} from the Worktree Bootstrap action.",
+        env,
+        sound="request",
+    )
     return False
 
 
@@ -3371,7 +3479,9 @@ def build_parser() -> argparse.ArgumentParser:
             "sync",
             "setup",
             "status",
+            "manage-launch",
             "manage",
+            "setup-manage-launch",
             "setup-manage",
             "branch-cleanup-event",
             "branch-cleanup",
@@ -3394,6 +3504,10 @@ def main(argv: Optional[Sequence[str]] = None, env: Optional[Mapping[str, str]] 
             cleanup_id = effective_env.get("HERDR_BRANCH_CLEANUP_ID")
             return review_pending_cleanups(state_dir, cleanup_id=cleanup_id, env=effective_env)
         target_path = resolve_target_path(args.target, effective_env)
+        if args.action == "manage-launch":
+            return launch_management_ui("manage", target_path, effective_env)
+        if args.action == "setup-manage-launch":
+            return launch_management_ui("setup-manage", target_path, effective_env)
         context = resolve_repository(target_path)
         if args.action == "status":
             lines, invalid = status_lines(context, state_dir)
@@ -3415,6 +3529,8 @@ def main(argv: Optional[Sequence[str]] = None, env: Optional[Mapping[str, str]] 
         execute_action(args.action, context, state_dir)
         return 0
     except NothingToDo as exc:
+        if args.action in ("manage", "setup-manage"):
+            notify_repository_unavailable(exc, effective_env)
         print(str(exc))
         return 0
     except KeyboardInterrupt:

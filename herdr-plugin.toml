@@ -1,6 +1,6 @@
 id = "zerodice0.worktree-bootstrap"
 name = "Worktree Bootstrap"
-version = "0.3.2"
+version = "0.3.3"
 min_herdr_version = "0.7.0"
 description = "Bootstrap new worktrees and interactively review local branch cleanup after removal."
 platforms = ["linux", "macos"]
@@ -34,21 +34,9 @@ id = "manage"
 title = "Worktree bootstrap settings"
 contexts = ["workspace"]
 command = [
-  "herdr",
-  "plugin",
-  "pane",
-  "open",
-  "--plugin",
-  "zerodice0.worktree-bootstrap",
-  "--entrypoint",
-  "manage",
-  "--placement",
-  "popup",
-  "--width",
-  "96",
-  "--height",
-  "24",
-  "--focus",
+  "python3",
+  "worktree_bootstrap.py",
+  "manage-launch",
 ]
 
 [[actions]]
@@ -56,21 +44,9 @@ id = "configure-setup"
 title = "Configure worktree setup commands"
 contexts = ["workspace"]
 command = [
-  "herdr",
-  "plugin",
-  "pane",
-  "open",
-  "--plugin",
-  "zerodice0.worktree-bootstrap",
-  "--entrypoint",
-  "setup-manage",
-  "--placement",
-  "popup",
-  "--width",
-  "84",
-  "--height",
-  "20",
-  "--focus",
+  "python3",
+  "worktree_bootstrap.py",
+  "setup-manage-launch",
 ]
 
 [[actions]]

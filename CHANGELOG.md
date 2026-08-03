@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.0] - 2026-08-03
+
+- Show every registered copy path and setup command through a bounded, vertically scrollable viewport.
+- Keep a visible range counter and position track on screen whenever more content is available.
+- Support `j`/`k`, Up/Down Arrow, and Page Up/Page Down navigation without closing the popup.
+- Move setup reordering and configuration removal off `j`/`k` so navigation cannot mutate configuration.
+- Add an optional, theme-aware `fzf` picker for multi-select path registration and removal, with collapsed ignored directories and NUL-safe path handling.
+- Keep direct path entry as an advanced fallback and clarify that unlisted paths are never copied.
+- Batch terminal refreshes in place so dashboard cursor movement does not clear to a blank frame.
+- Keep Escape bound to immediate picker cancellation in both navigation and search modes.
+
 ## [0.3.3] - 2026-08-03
 
 - Preflight management actions before opening their Herdr popup.

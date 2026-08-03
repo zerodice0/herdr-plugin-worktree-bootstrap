@@ -749,6 +749,8 @@ def validate_relative_path(value: str) -> str:
         raise BootstrapError("copy-list paths cannot be empty")
     if "\x00" in value:
         raise BootstrapError("copy-list paths cannot contain NUL bytes")
+    if "\n" in value or "\r" in value:
+        raise BootstrapError("copy-list paths cannot contain line breaks")
     if os.path.isabs(value) or PurePosixPath(value).is_absolute():
         raise BootstrapError(f"absolute path is not allowed: {value}")
     raw_parts = value.split("/")
@@ -1864,9 +1866,23 @@ def read_single_key(
         if character == "\x03":
             raise KeyboardInterrupt
         if character == "\x1b":
-            while select.select([file_descriptor], [], [], 0.01)[0]:
-                os.read(file_descriptor, 1)
-            return "q"
+            sequence = character
+            while len(sequence) < 8 and select.select([file_descriptor], [], [], 0.03)[0]:
+                sequence += os.read(file_descriptor, 1).decode("ascii", errors="ignore")
+                if sequence.endswith(("A", "B", "C", "D", "~")):
+                    break
+            return {
+                "\x1b[A": "up",
+                "\x1b[B": "down",
+                "\x1b[C": "right",
+                "\x1b[D": "left",
+                "\x1bOA": "up",
+                "\x1bOB": "down",
+                "\x1bOC": "right",
+                "\x1bOD": "left",
+                "\x1b[5~": "page-up",
+                "\x1b[6~": "page-down",
+            }.get(sequence, "escape")
         if character in ("\r", "\n"):
             return ""
         return character
@@ -1881,7 +1897,14 @@ def read_single_key(
 def normalize_cleanup_choice(value: str) -> str:
     choice = value.strip().casefold()
     # These jamo are produced by the same physical keys with a Korean layout.
-    return {"ㅇ": "d", "ㄹ": "f", "ㄴ": "s", "ㅂ": "q", "ㅏ": "k"}.get(choice, choice)
+    return {
+        "escape": "q",
+        "ㅇ": "d",
+        "ㄹ": "f",
+        "ㄴ": "s",
+        "ㅂ": "q",
+        "ㅏ": "k",
+    }.get(choice, choice)
 
 
 def review_pending_cleanups(
@@ -2587,6 +2610,33 @@ def _ui_width(columns: int) -> int:
     return max(28, min(columns, 96))
 
 
+class TerminalScreenRenderer:
+    """Batch terminal refreshes so navigation never exposes a blank frame."""
+
+    def __init__(
+        self,
+        *,
+        decorated: bool,
+        stream: Optional[Any] = None,
+    ) -> None:
+        self.decorated = decorated
+        self.stream = sys.stdout if stream is None else stream
+        self.initialized = False
+
+    def draw(self, lines: Sequence[str]) -> None:
+        if not self.decorated:
+            for line in lines:
+                print(line, file=self.stream)
+            return
+        prefix = "\033[2J\033[H" if not self.initialized else "\033[H"
+        self.stream.write(prefix + "\n".join(lines) + "\033[J")
+        self.stream.flush()
+        self.initialized = True
+
+    def invalidate(self) -> None:
+        self.initialized = False
+
+
 def _section_heading(
     title: str,
     summary: str,
@@ -2610,6 +2660,104 @@ def _section_heading(
 def _limited_count(total: int, limit: int) -> Optional[str]:
     remaining = total - limit
     return f"… {remaining} more" if remaining > 0 else None
+
+
+@dataclasses.dataclass(frozen=True)
+class ScrollableScreen:
+    lines: Tuple[str, ...]
+    offset: int
+    maximum_offset: int
+    page_size: int
+
+
+def _scroll_indicator(
+    offset: int,
+    page_size: int,
+    total: int,
+    width: int,
+    palette: ThemePalette,
+    *,
+    color_enabled: bool,
+) -> str:
+    start = offset + 1
+    end = min(total, offset + page_size)
+    if width < 44:
+        segments = [
+            StyledSegment("SCROLL ", "accent", bold=True),
+            StyledSegment(f"{start}–{end}/{total}", "text", bold=True),
+            StyledSegment("  K↑ J↓", "muted"),
+        ]
+    else:
+        segments = [
+            StyledSegment("SCROLL  ", "accent", bold=True),
+            StyledSegment(f"{start}–{end} / {total}", "text", bold=True),
+            StyledSegment("  ·  K/↑ up  J/↓ down", "muted"),
+        ]
+    if width >= 64:
+        track_size = min(12, max(6, width - 50))
+        maximum_offset = max(1, total - page_size)
+        marker = min(track_size - 1, round(offset * (track_size - 1) / maximum_offset))
+        track = "".join("█" if index == marker else "░" for index in range(track_size))
+        segments.extend([StyledSegment("  ", "subtle"), StyledSegment(track, "accent")])
+    return _flat_line(segments, width, palette, color_enabled=color_enabled)
+
+
+def _compose_scrollable_screen(
+    header: Sequence[str],
+    body: Sequence[str],
+    actions: Sequence[ActionSpec],
+    width: int,
+    rows: int,
+    palette: ThemePalette,
+    *,
+    color_enabled: bool,
+    requested_offset: int,
+    notice: Optional[Tuple[str, str]],
+) -> ScrollableScreen:
+    footer: List[str] = []
+    if notice:
+        footer.extend(
+            [
+                "",
+                _flat_line(
+                    [StyledSegment(notice[0], notice[1], bold=notice[1] in ("positive", "danger"))],
+                    width,
+                    palette,
+                    color_enabled=color_enabled,
+                ),
+            ]
+        )
+    footer.extend(
+        ["", _flat_separator(width, palette, color_enabled=color_enabled)]
+    )
+    footer.extend(_render_action_rows(actions, width, palette, color_enabled=color_enabled))
+    footer.append("")
+
+    page_size = max(1, rows - len(header) - len(footer))
+    scrollable = len(body) > page_size
+    if scrollable:
+        page_size = max(1, page_size - 1)
+    maximum_offset = max(0, len(body) - page_size)
+    offset = max(0, min(requested_offset, maximum_offset))
+    visible_body = list(body[offset : offset + page_size])
+    if scrollable:
+        footer.insert(
+            0,
+            _scroll_indicator(
+                offset,
+                page_size,
+                len(body),
+                width,
+                palette,
+                color_enabled=color_enabled,
+            ),
+        )
+    return ScrollableScreen(
+        tuple([*header, *visible_body, *footer]),
+        offset,
+        maximum_offset,
+        page_size,
+    )
 
 
 def _render_setup_rows(
@@ -2675,7 +2823,7 @@ def _render_setup_rows(
     return lines
 
 
-def render_setup_management_screen(
+def _render_setup_management_view(
     context: RepositoryContext,
     commands: Sequence[SetupCommand],
     palette: ThemePalette,
@@ -2684,11 +2832,11 @@ def render_setup_management_screen(
     rows: int,
     decorated: bool,
     color_enabled: bool,
+    scroll_offset: int = 0,
     notice: Optional[Tuple[str, str]] = None,
-) -> List[str]:
+) -> ScrollableScreen:
     width = _ui_width(columns)
-    command_limit = max(1, min(6, (rows - 14) // 2))
-    lines = [
+    header = [
         "",
         _flat_line(
             [
@@ -2709,6 +2857,8 @@ def render_setup_management_screen(
             palette,
             color_enabled=color_enabled,
         ),
+    ]
+    body = [
         "",
         _section_heading(
             "Automation",
@@ -2718,17 +2868,17 @@ def render_setup_management_screen(
             color_enabled=color_enabled,
         ),
     ]
-    lines.extend(
+    body.extend(
         _render_setup_rows(
             commands,
             width,
             palette,
             color_enabled=color_enabled,
-            limit=command_limit,
+            limit=max(1, len(commands)),
         )
     )
     if not commands:
-        lines.append(
+        body.append(
             _flat_line(
                 [StyledSegment("Runs after local files are copied into a new worktree.", "subtle", dim=True)],
                 width,
@@ -2736,36 +2886,59 @@ def render_setup_management_screen(
                 color_enabled=color_enabled,
             )
         )
-    if notice:
-        lines.extend(
-            [
-                "",
-                _flat_line(
-                    [StyledSegment(notice[0], notice[1], bold=notice[1] in ("positive", "danger"))],
-                    width,
-                    palette,
-                    color_enabled=color_enabled,
-                ),
-            ]
-        )
-    lines.extend(["", _flat_separator(width, palette, color_enabled=color_enabled)])
     actions: List[ActionSpec] = [
         ("N", "New", "accent"),
         ("E", "Edit", "accent"),
         ("X", "Delete", "danger"),
         ("U", "Up", "accent"),
-        ("J", "Down", "accent"),
+        ("M", "Move down", "accent"),
         ("R", "Run now", "positive"),
-        ("K", "Remove file", "warning"),
+        ("Z", "Remove config", "warning"),
         ("Q", "Back", "accent"),
     ]
-    lines.extend(_render_action_rows(actions, width, palette, color_enabled=color_enabled))
-    lines.append("")
-    return lines
+    return _compose_scrollable_screen(
+        header,
+        body,
+        actions,
+        width,
+        rows,
+        palette,
+        color_enabled=color_enabled,
+        requested_offset=scroll_offset,
+        notice=notice,
+    )
+
+
+def render_setup_management_screen(
+    context: RepositoryContext,
+    commands: Sequence[SetupCommand],
+    palette: ThemePalette,
+    *,
+    columns: int,
+    rows: int,
+    decorated: bool,
+    color_enabled: bool,
+    scroll_offset: int = 0,
+    notice: Optional[Tuple[str, str]] = None,
+) -> List[str]:
+    return list(
+        _render_setup_management_view(
+            context,
+            commands,
+            palette,
+            columns=columns,
+            rows=rows,
+            decorated=decorated,
+            color_enabled=color_enabled,
+            scroll_offset=scroll_offset,
+            notice=notice,
+        ).lines
+    )
 
 
 _MANAGE_KEY_ALIASES: Mapping[str, str] = {
     "ㅁ": "a",
+    "ㅑ": "i",
     "ㅇ": "d",
     "ㅊ": "c",
     "ㄴ": "s",
@@ -2779,7 +2952,14 @@ _MANAGE_KEY_ALIASES: Mapping[str, str] = {
     "ㅕ": "u",
     "ㅓ": "j",
     "ㅏ": "k",
+    "ㅡ": "m",
+    "ㅋ": "z",
     "ㅛ": "y",
+    "up": "k",
+    "down": "j",
+    "page-up": "page-up",
+    "page-down": "page-down",
+    "escape": "q",
 }
 
 
@@ -2879,11 +3059,12 @@ def manage_setup_commands(
     palette, decorated, color_enabled = _ui_appearance(effective_env)
     single_key_mode = decorated and sys.stdin.isatty()
     current = list(commands)
+    scroll_offset = 0
     notice: Optional[Tuple[str, str]] = None
+    renderer = TerminalScreenRenderer(decorated=decorated)
     while True:
         terminal_size = shutil.get_terminal_size((80, 24))
-        _clear_screen()
-        for line in render_setup_management_screen(
+        screen = _render_setup_management_view(
             context,
             current,
             palette,
@@ -2891,9 +3072,11 @@ def manage_setup_commands(
             rows=terminal_size.lines,
             decorated=decorated,
             color_enabled=color_enabled,
+            scroll_offset=scroll_offset,
             notice=notice,
-        ):
-            print(line)
+        )
+        scroll_offset = screen.offset
+        renderer.draw(screen.lines)
         notice = None
         try:
             choice = _read_manage_choice(single_key_mode=single_key_mode)
@@ -2902,6 +3085,18 @@ def manage_setup_commands(
         if choice == "q":
             return 0
         if choice == "":
+            continue
+        if choice == "k":
+            scroll_offset = max(0, scroll_offset - 1)
+            continue
+        if choice == "j":
+            scroll_offset = min(screen.maximum_offset, scroll_offset + 1)
+            continue
+        if choice == "page-up":
+            scroll_offset = max(0, scroll_offset - screen.page_size)
+            continue
+        if choice == "page-down":
+            scroll_offset = min(screen.maximum_offset, scroll_offset + screen.page_size)
             continue
         if choice == "n":
             try:
@@ -2974,7 +3169,7 @@ def manage_setup_commands(
             current = updated
             notice = (f"✓ Deleted {command.name}", "positive")
             continue
-        if choice in ("u", "j"):
+        if choice in ("u", "m"):
             _show_manage_form(
                 "Reorder setup commands",
                 "Commands run from top to bottom and stop at the first failure.",
@@ -3009,7 +3204,7 @@ def manage_setup_commands(
             except (BootstrapError, NothingToDo) as exc:
                 notice = (str(exc), "warning")
             continue
-        if choice == "k":
+        if choice == "z":
             if not (context.source / SETUP_FILE).exists():
                 notice = ("Setup configuration does not exist.", "warning")
                 continue
@@ -3049,7 +3244,155 @@ def _direct_root_items(context: RepositoryContext, included: Sequence[str]) -> L
     return rows
 
 
-def render_management_screen(
+def list_ignored_path_candidates(
+    context: RepositoryContext,
+    included: Sequence[str],
+) -> List[str]:
+    """List ignored paths without expanding whole ignored directory trees."""
+
+    result = _run_git(
+        context.source,
+        [
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "--no-empty-directory",
+            "-z",
+        ],
+        text=False,
+    )
+    candidates: List[str] = []
+    seen = set()
+    for encoded in result.stdout.split(b"\0"):
+        if not encoded:
+            continue
+        candidate = os.fsdecode(encoded).rstrip("/")
+        if not candidate or candidate == ".herdr" or candidate.startswith(".herdr/"):
+            continue
+        try:
+            candidate = validate_relative_path(candidate)
+            validate_copy_paths([*included, candidate])
+            _ensure_no_symlink_parents(context.source, candidate)
+        except BootstrapError:
+            continue
+        if candidate in seen or not _path_lexists(context.source / candidate):
+            continue
+        seen.add(candidate)
+        candidates.append(candidate)
+    return sorted(candidates, key=lambda value: (value.casefold(), value))
+
+
+def _fzf_color(color: ColorValue) -> Optional[str]:
+    if not isinstance(color, tuple):
+        return None
+    return "#{:02x}{:02x}{:02x}".format(*color)
+
+
+def _fzf_color_spec(palette: ThemePalette) -> Optional[str]:
+    values = {
+        "fg": _fzf_color(palette.text),
+        "fg+": _fzf_color(palette.text),
+        "hl": _fzf_color(palette.accent),
+        "hl+": _fzf_color(palette.accent),
+        "pointer": _fzf_color(palette.accent),
+        "marker": _fzf_color(palette.positive),
+        "prompt": _fzf_color(palette.accent),
+        "info": _fzf_color(palette.muted),
+        "header": _fzf_color(palette.muted),
+        "spinner": _fzf_color(palette.accent),
+    }
+    configured = [f"{name}:{value}" for name, value in values.items() if value]
+    return ",".join(configured) if configured else None
+
+
+def _fzf_executable(env: Mapping[str, str]) -> Optional[str]:
+    return shutil.which("fzf", path=env.get("PATH"))
+
+
+def select_paths_with_fzf(
+    candidates: Sequence[str],
+    palette: ThemePalette,
+    *,
+    operation: str,
+    env: Mapping[str, str],
+) -> Optional[List[str]]:
+    """Return selected paths, or None when the picker is cancelled."""
+
+    executable = _fzf_executable(env)
+    if executable is None:
+        raise BootstrapError("fzf is not available")
+    if not candidates:
+        return []
+    if operation == "add":
+        prompt = "Add files › "
+        header = "Ignored paths available to copy into new worktrees"
+    elif operation == "remove":
+        prompt = "Stop copying › "
+        header = "Registered paths · source files will not be deleted"
+    else:
+        raise BootstrapError(f"unknown path picker operation: {operation}")
+
+    bindings = (
+        "start:disable-search,"
+        "j:down,k:up,space:toggle,"
+        "/:enable-search+unbind(j,k,/)+change-prompt(Search › ),"
+        "esc:abort"
+    )
+    command = [
+        executable,
+        "--read0",
+        "--print0",
+        "--multi",
+        "--disabled",
+        "--layout=reverse",
+        "--style=minimal",
+        "--border=none",
+        "--header-border=none",
+        "--input-border=none",
+        "--list-border=none",
+        "--footer-border=none",
+        "--highlight-line",
+        "--cycle",
+        "--scheme=path",
+        "--filepath-word",
+        "--info=inline-right",
+        "--pointer=›",
+        "--marker=✓",
+        "--scrollbar=│",
+        f"--prompt={prompt}",
+        f"--header={header}",
+        "--header-first",
+        "--footer=J/K or ↑/↓ move  ·  Space select  ·  Enter apply  ·  / search  ·  Esc cancel",
+        f"--bind={bindings}",
+    ]
+    color_spec = _fzf_color_spec(palette)
+    if color_spec:
+        command.append(f"--color={color_spec}")
+    child_env = dict(env)
+    child_env["FZF_DEFAULT_OPTS"] = ""
+    payload = b"\0".join(os.fsencode(path) for path in candidates) + b"\0"
+    try:
+        completed = subprocess.run(
+            command,
+            input=payload,
+            stdout=subprocess.PIPE,
+            check=False,
+            env=child_env,
+        )
+    except OSError as exc:
+        raise BootstrapError(f"could not open fzf: {exc}") from exc
+    if completed.returncode == 0:
+        selected = [os.fsdecode(value) for value in completed.stdout.split(b"\0") if value]
+        selected_set = set(selected)
+        return [path for path in candidates if path in selected_set]
+    if completed.returncode in (1, 130):
+        return None
+    raise BootstrapError(f"fzf exited with code {completed.returncode}")
+
+
+def _render_management_view(
     context: RepositoryContext,
     paths: Sequence[str],
     statuses: Sequence[CopyEntryStatus],
@@ -3062,17 +3405,16 @@ def render_management_screen(
     decorated: bool,
     color_enabled: bool,
     details_visible: bool = False,
+    scroll_offset: int = 0,
     notice: Optional[Tuple[str, str]] = None,
-) -> List[str]:
+) -> ScrollableScreen:
     width = _ui_width(columns)
     addable = [name for name, label in root_items if label == "can add/ignored"]
     tracked = sum(label == "cannot add/tracked" for _name, label in root_items)
     unignored = sum(label == "cannot add/unignored" for _name, label in root_items)
-    copy_limit = max(1, min(4, rows - (21 if details_visible else 15)))
-    setup_limit = max(1, min(3, (rows - 16) // 2))
     checkout_status = "PRIMARY CHECKOUT" if context.target_is_primary else "WORKTREE"
     checkout_role = "info" if context.target_is_primary else "positive"
-    lines = [
+    header = [
         "",
         _flat_line(
             [
@@ -3096,7 +3438,7 @@ def render_management_screen(
         ),
     ]
     if context.target != context.source:
-        lines.append(
+        header.append(
             _flat_line(
                 [
                     StyledSegment("Target   ", "subtle"),
@@ -3108,20 +3450,18 @@ def render_management_screen(
             )
         )
 
-    lines.extend(
-        [
-            "",
-            _section_heading(
-                "Copy plan",
-                f"{len(paths)} selected  ·  {len(addable)} available",
-                width,
-                palette,
-                color_enabled=color_enabled,
-            ),
-        ]
-    )
+    body = [
+        "",
+        _section_heading(
+            "Copy plan",
+            f"{len(paths)} selected  ·  {len(addable)} root available",
+            width,
+            palette,
+            color_enabled=color_enabled,
+        ),
+    ]
     if not paths:
-        lines.append(
+        body.append(
             _flat_line(
                 [StyledSegment("No local files selected.", "subtle", dim=True)],
                 width,
@@ -3130,10 +3470,10 @@ def render_management_screen(
             )
         )
     else:
-        for index, status_value in enumerate(statuses[:copy_limit], 1):
+        for index, status_value in enumerate(statuses, 1):
             target_label = "target present" if status_value.target_exists else "new target"
             target_role = "positive" if status_value.target_exists else "info"
-            lines.append(
+            body.append(
                 _flat_line(
                     [
                         StyledSegment(f"{index:>2}  ", "subtle"),
@@ -3146,21 +3486,11 @@ def render_management_screen(
                     color_enabled=color_enabled,
                 )
             )
-        remaining = _limited_count(len(statuses), copy_limit)
-        if remaining:
-            lines.append(
-                _flat_line(
-                    [StyledSegment(remaining, "subtle", dim=True)],
-                    width,
-                    palette,
-                    color_enabled=color_enabled,
-                )
-            )
     if addable:
         preview = ", ".join(addable[:3])
         if len(addable) > 3:
             preview += f", +{len(addable) - 3}"
-        lines.append(
+        body.append(
             _flat_line(
                 [
                     StyledSegment("+ ", "positive", bold=True),
@@ -3172,7 +3502,7 @@ def render_management_screen(
             )
         )
 
-    lines.extend(
+    body.extend(
         [
             "",
             _section_heading(
@@ -3184,18 +3514,18 @@ def render_management_screen(
             ),
         ]
     )
-    lines.extend(
+    body.extend(
         _render_setup_rows(
             commands,
             width,
             palette,
             color_enabled=color_enabled,
-            limit=setup_limit,
+            limit=max(1, len(commands)),
         )
     )
 
     if details_visible:
-        lines.extend(
+        body.extend(
             [
                 "",
                 _section_heading(
@@ -3208,9 +3538,8 @@ def render_management_screen(
             ]
         )
         detail_rows = [item for item in root_items if item[1] in ("included", "can add/ignored")]
-        detail_limit = max(1, min(5, rows - len(lines) - 5))
         if not detail_rows:
-            lines.append(
+            body.append(
                 _flat_line(
                     [StyledSegment("No eligible root paths.", "subtle", dim=True)],
                     width,
@@ -3218,9 +3547,9 @@ def render_management_screen(
                     color_enabled=color_enabled,
                 )
             )
-        for name, label in detail_rows[:detail_limit]:
+        for name, label in detail_rows:
             included = label == "included"
-            lines.append(
+            body.append(
                 _flat_line(
                     [
                         StyledSegment("✓ " if included else "+ ", "accent" if included else "positive", bold=True),
@@ -3232,42 +3561,62 @@ def render_management_screen(
                     color_enabled=color_enabled,
                 )
             )
-        remaining = _limited_count(len(detail_rows), detail_limit)
-        if remaining:
-            lines.append(
-                _flat_line(
-                    [StyledSegment(remaining, "subtle", dim=True)],
-                    width,
-                    palette,
-                    color_enabled=color_enabled,
-                )
-            )
-
-    if notice:
-        lines.extend(
-            [
-                "",
-                _flat_line(
-                    [StyledSegment(notice[0], notice[1], bold=notice[1] in ("positive", "danger"))],
-                    width,
-                    palette,
-                    color_enabled=color_enabled,
-                ),
-            ]
-        )
-    lines.extend(["", _flat_separator(width, palette, color_enabled=color_enabled)])
     actions: List[ActionSpec] = [
-        ("A", "Add", "accent"),
-        ("D", "Remove", "danger"),
+        ("A", "Add files", "accent"),
+        ("D", "Stop copying", "danger"),
+        ("I", "Type path", "accent"),
         ("C", "Setup", "accent"),
         ("S", "Sync", "positive"),
         ("T", "Status", "info"),
         ("V", "Hide paths" if details_visible else "Paths", "accent"),
         ("Q", "Close", "accent"),
     ]
-    lines.extend(_render_action_rows(actions, width, palette, color_enabled=color_enabled))
-    lines.append("")
-    return lines
+    return _compose_scrollable_screen(
+        header,
+        body,
+        actions,
+        width,
+        rows,
+        palette,
+        color_enabled=color_enabled,
+        requested_offset=scroll_offset,
+        notice=notice,
+    )
+
+
+def render_management_screen(
+    context: RepositoryContext,
+    paths: Sequence[str],
+    statuses: Sequence[CopyEntryStatus],
+    commands: Sequence[SetupCommand],
+    root_items: Sequence[Tuple[str, str]],
+    palette: ThemePalette,
+    *,
+    columns: int,
+    rows: int,
+    decorated: bool,
+    color_enabled: bool,
+    details_visible: bool = False,
+    scroll_offset: int = 0,
+    notice: Optional[Tuple[str, str]] = None,
+) -> List[str]:
+    return list(
+        _render_management_view(
+            context,
+            paths,
+            statuses,
+            commands,
+            root_items,
+            palette,
+            columns=columns,
+            rows=rows,
+            decorated=decorated,
+            color_enabled=color_enabled,
+            details_visible=details_visible,
+            scroll_offset=scroll_offset,
+            notice=notice,
+        ).lines
+    )
 
 
 def render_status_screen(
@@ -3346,12 +3695,13 @@ def manage(
     palette, decorated, color_enabled = _ui_appearance(effective_env)
     single_key_mode = decorated and sys.stdin.isatty()
     details_visible = False
+    scroll_offset = 0
     notice: Optional[Tuple[str, str]] = None
+    renderer = TerminalScreenRenderer(decorated=decorated)
     if (context.source / SETUP_FILE).exists():
         ensure_control_excluded(context, SETUP_FILE)
     while True:
         terminal_size = shutil.get_terminal_size((80, 24))
-        _clear_screen()
         try:
             paths = read_copy_list(context.source)
             root_items = _direct_root_items(context, paths)
@@ -3365,7 +3715,7 @@ def manage(
                 return 1
             continue
 
-        for line in render_management_screen(
+        screen = _render_management_view(
             context,
             paths,
             statuses,
@@ -3377,9 +3727,11 @@ def manage(
             decorated=decorated,
             color_enabled=color_enabled,
             details_visible=details_visible,
+            scroll_offset=scroll_offset,
             notice=notice,
-        ):
-            print(line)
+        )
+        scroll_offset = screen.offset
+        renderer.draw(screen.lines)
         notice = None
         try:
             choice = _read_manage_choice(single_key_mode=single_key_mode)
@@ -3389,13 +3741,53 @@ def manage(
             return 0
         if choice in ("", "r"):
             continue
+        if choice == "k":
+            scroll_offset = max(0, scroll_offset - 1)
+            continue
+        if choice == "j":
+            scroll_offset = min(screen.maximum_offset, scroll_offset + 1)
+            continue
+        if choice == "page-up":
+            scroll_offset = max(0, scroll_offset - screen.page_size)
+            continue
+        if choice == "page-down":
+            scroll_offset = min(screen.maximum_offset, scroll_offset + screen.page_size)
+            continue
         if choice == "v":
             details_visible = not details_visible
+            scroll_offset = 10**9 if details_visible else 0
             continue
-        if choice == "a":
+        if choice == "a" and _fzf_executable(effective_env):
+            try:
+                candidates = list_ignored_path_candidates(context, paths)
+                if not candidates:
+                    notice = ("No additional ignored paths are available.", "warning")
+                    continue
+                selected = select_paths_with_fzf(
+                    candidates,
+                    palette,
+                    operation="add",
+                    env=effective_env,
+                )
+                if selected is None:
+                    notice = ("Nothing changed.", "subtle")
+                    continue
+                if not selected:
+                    notice = ("No paths were selected.", "warning")
+                    continue
+                updated = validate_copy_paths([*paths, *selected])
+                write_copy_list(context, updated)
+                notice = (
+                    f"✓ Added {len(selected)} path{'s' if len(selected) != 1 else ''} to the copy plan",
+                    "positive",
+                )
+            except BootstrapError as exc:
+                notice = (f"Could not add paths: {exc}", "danger")
+            continue
+        if choice in ("a", "i"):
             _show_manage_form(
                 "Add a local path",
-                "Enter a repository-relative ignored path from the primary checkout.",
+                "Enter one repository-relative ignored path from the primary checkout.",
                 palette,
                 columns=terminal_size.columns,
                 color_enabled=color_enabled,
@@ -3418,6 +3810,30 @@ def manage(
         if choice == "d":
             if not paths:
                 notice = ("The copy plan is already empty.", "warning")
+                continue
+            if _fzf_executable(effective_env):
+                try:
+                    selected = select_paths_with_fzf(
+                        paths,
+                        palette,
+                        operation="remove",
+                        env=effective_env,
+                    )
+                    if selected is None:
+                        notice = ("Nothing changed.", "subtle")
+                        continue
+                    if not selected:
+                        notice = ("No paths were selected.", "warning")
+                        continue
+                    selected_set = set(selected)
+                    updated = [path for path in paths if path not in selected_set]
+                    write_copy_list(context, updated)
+                    notice = (
+                        f"✓ Stopped copying {len(selected)} path{'s' if len(selected) != 1 else ''}",
+                        "positive",
+                    )
+                except BootstrapError as exc:
+                    notice = (f"Could not update paths: {exc}", "danger")
                 continue
             _show_manage_form(
                 "Remove a local path",

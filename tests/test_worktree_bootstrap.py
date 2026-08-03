@@ -50,7 +50,17 @@ class PathValidationTests(unittest.TestCase):
             )
 
     def test_rejects_unsafe_or_ambiguous_paths(self):
-        invalid = [".", "/absolute", "../escape", "a/../b", "a/./b", "a//b", "a/"]
+        invalid = [
+            ".",
+            "/absolute",
+            "../escape",
+            "a/../b",
+            "a/./b",
+            "a//b",
+            "a/",
+            "line\nbreak",
+            "carriage\rreturn",
+        ]
         for value in invalid:
             with self.subTest(value=value), self.assertRaises(plugin.BootstrapError):
                 plugin.validate_relative_path(value)
@@ -374,6 +384,28 @@ accent = "cyan"
         self.assertEqual(restored[6][plugin.termios.VTIME], original[6][plugin.termios.VTIME])
         self.assertEqual(output.getvalue(), "\033[?25l\033[?25h")
 
+    def test_single_key_reader_preserves_arrow_key_sequences(self):
+        for encoded, expected in (
+            (b"\x1b[A", "up"),
+            (b"\x1b[B", "down"),
+            (b"\x1bOA", "up"),
+            (b"\x1bOB", "down"),
+        ):
+            with self.subTest(expected=expected):
+                master, slave = pty.openpty()
+                output = io.StringIO()
+                writer = threading.Timer(0.05, os.write, args=(master, encoded))
+                writer.start()
+                try:
+                    self.assertEqual(
+                        plugin.read_single_key(input_fd=slave, output_stream=output),
+                        expected,
+                    )
+                finally:
+                    writer.join()
+                    os.close(master)
+                    os.close(slave)
+
     def test_cleanup_choice_supports_enter_escape_and_korean_layout_keys(self):
         self.assertEqual(plugin.normalize_cleanup_choice(""), "")
         self.assertEqual(plugin.normalize_cleanup_choice("ㅇ"), "d")
@@ -381,6 +413,7 @@ accent = "cyan"
         self.assertEqual(plugin.normalize_cleanup_choice("ㄴ"), "s")
         self.assertEqual(plugin.normalize_cleanup_choice("ㅂ"), "q")
         self.assertEqual(plugin.normalize_cleanup_choice("ㅏ"), "k")
+        self.assertEqual(plugin.normalize_cleanup_choice("escape"), "q")
 
     def test_management_dashboard_hides_low_value_blocked_paths_by_default(self):
         palette = plugin.resolve_theme_palette(plugin.ThemeSettings(name="tokyo-night"))
@@ -411,9 +444,11 @@ accent = "cyan"
             color_enabled=False,
         )
         rendered = "\n".join(lines)
-        self.assertIn("COPY PLAN  1 selected  ·  1 available", rendered)
+        self.assertIn("COPY PLAN  1 selected  ·  1 root available", rendered)
         self.assertIn("SETUP  1 command", rendered)
-        self.assertIn("A Add    D Remove    C Setup", rendered)
+        self.assertIn("A Add files", rendered)
+        self.assertIn("D Stop copying", rendered)
+        self.assertIn("I Type path", rendered)
         self.assertNotIn("README.md", rendered)
         self.assertNotIn("notes.txt", rendered)
         self.assertNotIn("╭", rendered)
@@ -459,6 +494,164 @@ accent = "cyan"
             with mock.patch("builtins.input") as line_input:
                 self.assertEqual(plugin._read_manage_choice(single_key_mode=True), "c")
         line_input.assert_not_called()
+
+    def test_management_arrow_keys_map_to_scrolling(self):
+        self.assertEqual(plugin.normalize_manage_choice("up"), "k")
+        self.assertEqual(plugin.normalize_manage_choice("down"), "j")
+        self.assertEqual(plugin.normalize_manage_choice("escape"), "q")
+
+    def test_management_dashboard_scrolls_through_every_registered_value(self):
+        palette = plugin.resolve_theme_palette(plugin.ThemeSettings(name="tokyo-night"))
+        context = plugin.RepositoryContext(
+            target=Path("/tmp/repo"),
+            source=Path("/tmp/repo"),
+            common_git_dir=Path("/tmp/repo/.git"),
+            target_is_primary=True,
+        )
+        paths = [f"local/file-{index:02}.txt" for index in range(12)]
+        statuses = [
+            plugin.CopyEntryStatus(path, True, False, "ignored", "eligible")
+            for path in paths
+        ]
+        commands = [
+            plugin.SetupCommand(f"Command {index:02}", ("tool", str(index)), 60)
+            for index in range(8)
+        ]
+        first = plugin._render_management_view(
+            context,
+            paths,
+            statuses,
+            commands,
+            [],
+            palette,
+            columns=80,
+            rows=20,
+            decorated=True,
+            color_enabled=False,
+        )
+        last = plugin._render_management_view(
+            context,
+            paths,
+            statuses,
+            commands,
+            [],
+            palette,
+            columns=80,
+            rows=20,
+            decorated=True,
+            color_enabled=False,
+            scroll_offset=10**9,
+        )
+        first_text = "\n".join(first.lines)
+        last_text = "\n".join(last.lines)
+        self.assertGreater(first.maximum_offset, 0)
+        self.assertIn("SCROLL", first_text)
+        self.assertIn("K/↑ up  J/↓ down", first_text)
+        self.assertIn(paths[0], first_text)
+        self.assertNotIn(paths[-1], first_text)
+        self.assertIn("Command 07", last_text)
+        self.assertEqual(last.offset, last.maximum_offset)
+        self.assertNotIn("… 8 more", first_text)
+        self.assertLessEqual(len(first.lines), 20)
+        self.assertLessEqual(len(last.lines), 20)
+
+    def test_setup_dashboard_scrolls_without_reusing_j_or_k_for_mutations(self):
+        palette = plugin.resolve_theme_palette(plugin.ThemeSettings(name="tokyo-night"))
+        context = plugin.RepositoryContext(
+            target=Path("/tmp/repo"),
+            source=Path("/tmp/repo"),
+            common_git_dir=Path("/tmp/repo/.git"),
+            target_is_primary=True,
+        )
+        commands = [
+            plugin.SetupCommand(f"Command {index:02}", ("tool", str(index)), 60)
+            for index in range(10)
+        ]
+        screen = plugin._render_setup_management_view(
+            context,
+            commands,
+            palette,
+            columns=84,
+            rows=20,
+            decorated=True,
+            color_enabled=False,
+            scroll_offset=10**9,
+        )
+        rendered = "\n".join(screen.lines)
+        self.assertIn("Command 09", rendered)
+        self.assertIn("M Move down", rendered)
+        self.assertIn("Z Remove config", rendered)
+        self.assertIn("K/↑ up  J/↓ down", rendered)
+
+    def test_scroll_hint_keeps_both_directions_visible_on_narrow_terminals(self):
+        palette = plugin.resolve_theme_palette(plugin.ThemeSettings(name="tokyo-night"))
+        line = plugin._scroll_indicator(
+            2,
+            4,
+            30,
+            28,
+            palette,
+            color_enabled=False,
+        )
+        self.assertIn("SCROLL", line)
+        self.assertIn("K↑ J↓", line)
+        self.assertLessEqual(plugin._display_width(line), 28)
+
+    def test_terminal_renderer_clears_once_then_refreshes_without_blank_frame(self):
+        output = io.StringIO()
+        renderer = plugin.TerminalScreenRenderer(decorated=True, stream=output)
+        renderer.draw(["first", "screen"])
+        renderer.draw(["second", "screen"])
+        rendered = output.getvalue()
+        self.assertEqual(rendered.count("\033[2J"), 1)
+        self.assertEqual(rendered.count("\033[H"), 2)
+        self.assertIn("\033[Hsecond\nscreen\033[J", rendered)
+
+    def test_fzf_picker_uses_nul_paths_multi_select_and_modal_navigation(self):
+        palette = plugin.resolve_theme_palette(plugin.ThemeSettings(name="tokyo-night"))
+        completed = subprocess.CompletedProcess(
+            ["fzf"],
+            0,
+            stdout="unicode-한글\0space dir/file\0".encode("utf-8"),
+        )
+        with mock.patch.object(plugin, "_fzf_executable", return_value="/opt/bin/fzf"):
+            with mock.patch.object(plugin.subprocess, "run", return_value=completed) as run_mock:
+                selected = plugin.select_paths_with_fzf(
+                    ["space dir/file", "unicode-한글"],
+                    palette,
+                    operation="add",
+                    env={"PATH": "/opt/bin", "TERM": "xterm-256color"},
+                )
+        self.assertEqual(selected, ["space dir/file", "unicode-한글"])
+        command = run_mock.call_args.args[0]
+        self.assertIn("--read0", command)
+        self.assertIn("--print0", command)
+        self.assertIn("--multi", command)
+        self.assertIn("--disabled", command)
+        binding = next(value for value in command if value.startswith("--bind="))
+        self.assertIn("j:down,k:up,space:toggle", binding)
+        self.assertIn("/:enable-search", binding)
+        self.assertIn("esc:abort", binding)
+        self.assertNotIn("unbind(esc)", binding)
+        self.assertEqual(
+            run_mock.call_args.kwargs["input"],
+            "space dir/file\0unicode-한글\0".encode("utf-8"),
+        )
+        self.assertEqual(run_mock.call_args.kwargs["env"]["FZF_DEFAULT_OPTS"], "")
+
+    def test_fzf_escape_cancellation_returns_no_selection(self):
+        palette = plugin.resolve_theme_palette(plugin.ThemeSettings(name="tokyo-night"))
+        completed = subprocess.CompletedProcess(["fzf"], 130, stdout=b"")
+        with mock.patch.object(plugin, "_fzf_executable", return_value="/opt/bin/fzf"):
+            with mock.patch.object(plugin.subprocess, "run", return_value=completed):
+                self.assertIsNone(
+                    plugin.select_paths_with_fzf(
+                        ["alpha", "beta"],
+                        palette,
+                        operation="remove",
+                        env={"PATH": "/opt/bin"},
+                    )
+                )
 
 
 class GitRepositoryTestCase(unittest.TestCase):
@@ -817,6 +1010,25 @@ class SetupBehaviorTests(GitRepositoryTestCase):
 
 
 class StateAndManagementTests(GitRepositoryTestCase):
+    def test_ignored_picker_candidates_include_nested_paths_without_expanding_directories(self):
+        (self.source / ".env").write_text("secret", encoding="utf-8")
+        (self.source / "cache" / "deep").mkdir(parents=True)
+        (self.source / "cache" / "deep" / "artifact").write_text("cache", encoding="utf-8")
+        (self.source / "space dir").mkdir()
+        (self.source / "space dir" / "local file").write_text("space", encoding="utf-8")
+        (self.source / "unicode-한글").mkdir()
+        (self.source / "unicode-한글" / "설정").write_text("value", encoding="utf-8")
+        plugin.write_copy_list(self.context, [".env"])
+
+        candidates = plugin.list_ignored_path_candidates(self.context, [".env"])
+
+        self.assertIn("cache", candidates)
+        self.assertIn("space dir", candidates)
+        self.assertIn("unicode-한글", candidates)
+        self.assertNotIn(".env", candidates)
+        self.assertFalse(any(path.startswith("cache/") for path in candidates))
+        self.assertFalse(any(path == ".herdr" or path.startswith(".herdr/") for path in candidates))
+
     def test_setup_management_has_a_direct_cli_entrypoint(self):
         self.assertEqual(
             plugin.build_parser().parse_args(["setup-manage"]).action,

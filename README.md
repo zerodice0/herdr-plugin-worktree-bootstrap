@@ -1,6 +1,6 @@
 # Herdr Worktree Bootstrap
 
-`zerodice0.worktree-bootstrap` prepares new [Herdr](https://herdr.dev/) Git worktrees, inventories active and removed checkouts, and reviews branches and leftover files after removal. Repository-local lifecycle commands can run after creation, before an Inventory-managed removal, and after any observed removal event.
+`zerodice0.worktree-bootstrap` prepares new [Herdr](https://herdr.dev/) Git worktrees, inventories active and removed checkouts, and reviews branches and leftover files after removal. Repository-local lifecycle commands can run after creation, before a plugin-managed removal, and after any observed removal event. Agents can inspect and manage worktrees directly through a non-interactive JSON CLI.
 
 It is deliberately conservative:
 
@@ -8,7 +8,7 @@ It is deliberately conservative:
 - only Git-ignored, untracked paths are copied;
 - directories replace the target directory instead of merging into it;
 - lifecycle commands are argv arrays, run sequentially without a shell, and stop on the first failure;
-- branch retention is the default, safe deletion uses `git branch -d`, and force deletion requires typing the exact branch name;
+- branch retention is the default, safe deletion uses `git branch -d`, and force deletion requires the exact branch name;
 - leftover checkout files are never deleted automatically, and deletion requires verified provenance plus exact-name confirmation;
 - there is no ecosystem detection and no automatic selection of dependency or build output directories.
 
@@ -19,7 +19,7 @@ The plugin supports Herdr 0.7.0 or newer on Linux and macOS. It requires Python 
 Install the tagged release from GitHub:
 
 ```sh
-herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.5.0
+herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.6.0
 ```
 
 For local development, link this checkout:
@@ -28,7 +28,7 @@ For local development, link this checkout:
 herdr plugin link .
 ```
 
-Copying and lifecycle commands are opt-in per repository. If neither control file exists in the primary checkout, worktree creation does not change project files. Branch and leftover-file cleanup never happens without an explicit interactive choice.
+Copying and lifecycle commands are opt-in per repository. If neither control file exists in the primary checkout, worktree creation does not change project files. Branch and leftover-file cleanup never happens without an explicit interactive choice or confirmed headless decision.
 
 ## Copy local files
 
@@ -83,7 +83,7 @@ Create `.herdr/worktree-setup.json` in the primary checkout:
 }
 ```
 
-`on_created` runs in the new worktree after local files are copied. `before_remove` runs in an active worktree only when removal is started from **Worktree inventory**; a failure blocks removal. `after_remove` runs in the primary checkout after a `worktree.removed` event, including removals started outside Inventory. Version 1 files containing `commands` remain supported and are interpreted as `on_created` commands; the editors migrate them to version 2 when they next save.
+`on_created` runs in the new worktree after local files are copied. `before_remove` runs in an active worktree only when removal is started from **Worktree inventory** or the direct `remove-worktree` action; a failure blocks removal. `after_remove` runs in the primary checkout after a `worktree.removed` event, including removals started outside the plugin. Version 1 files containing `commands` remain supported and are interpreted as `on_created` commands; the editors migrate them to version 2 when they next save.
 
 Commands run in array order. A non-zero exit, timeout, or missing executable stops the phase immediately. The plugin does not invoke a shell, expand environment variables in argv, or implement platform branches. Long-running processes such as development servers and file watchers are not suitable lifecycle commands.
 
@@ -100,11 +100,11 @@ Every phase receives these string environment variables:
 
 This file is also local opt-in configuration. When the management popup sees it, the popup adds `/.herdr/worktree-setup.json` to `.git/info/exclude`.
 
-Use `on_created` for terminating jobs such as `npm ci`, `bundle install`, or `flutter pub get`. Use `before_remove` to stop project-scoped writers that could recreate ignored build output during removal. Commands should be safe to retry: if Herdr refuses removal, a later Inventory attempt runs `before_remove` again.
+Use `on_created` for terminating jobs such as `npm ci`, `bundle install`, or `flutter pub get`. Use `before_remove` to stop project-scoped writers that could recreate ignored build output during removal. Commands should be safe to retry: if Herdr refuses removal, a later Inventory or `remove-worktree` attempt runs `before_remove` again.
 
 ## Actions
 
-The plugin exposes these Herdr actions:
+The plugin exposes these Herdr actions and one CLI-only removal action:
 
 | Action | Behavior |
 | --- | --- |
@@ -116,6 +116,7 @@ The plugin exposes these Herdr actions:
 | `configure-setup` | Open the setup command editor directly. |
 | `review-branch-cleanup` | Review branch cleanups that could not be shown immediately or were skipped. |
 | `worktree-inventory` | Reconcile Git registrations, branches, recorded provenance, and checkout paths; configure lifecycle phases and start reviewed removal or residue cleanup. |
+| `remove-worktree` (CLI only) | Request confirmed Herdr removal after provenance, workspace, dirty-state, and `before_remove` checks. Not a manifest action; invoke the script directly. |
 
 Invoke an action from the Herdr UI, or from the CLI:
 
@@ -170,6 +171,123 @@ When adding or editing a command, enter its display name, one argv command line,
 
 `r` runs the saved setup immediately in the current target worktree. The same fail-fast, timeout, and command-not-found rules used by automatic bootstrap apply to this manual run.
 
+## Headless and agent use
+
+Agents should invoke the Python script directly with an explicit target:
+
+```sh
+python3 <plugin root>/worktree_bootstrap.py <action> --target <path>
+```
+
+`herdr plugin action invoke` always targets the focused Herdr workspace, not the caller's working directory or a supplied workspace environment variable. Calling the script directly avoids changing user workspace focus and returns output to the caller. Locate the installed plugin root with `herdr plugin list`; for a linked checkout, the root is that checkout itself. A GitHub install may, for example, live at `~/.config/herdr/plugins/github-installations/<id>-<hash>/<n>/checkout`; do not assume this path is fixed.
+
+### Read-only inspection
+
+```sh
+python3 <plugin root>/worktree_bootstrap.py status --target <path> --json
+python3 <plugin root>/worktree_bootstrap.py inventory --target <repo> --json
+python3 <plugin root>/worktree_bootstrap.py branch-cleanup --list --json
+```
+
+`status --json` returns `source`, `target`, `common_git_dir`, `copy_list`, `lifecycle`, `last_run`, `pending_branch_cleanups` (a count), and `branch_cleanup_popup`. Copy-list entries include source/target presence, eligibility, detail, and whether copying is allowed. Lifecycle data includes the configured argv arrays and timeouts for all three phases. Missing control files are valid empty configurations; invalid files have `valid: false`, an `error` message, and empty entry/command lists.
+
+`inventory --json` returns `repo_root`, `worktree_root`, `items`, and `pending_branch_cleanups` (the requests for that repository). Each item includes registration, branch, creation/removal provenance, lifecycle results, a `leftover` inspection, `removable`, and `confirm_token`. The token is the branch name, or the directory name for a detached worktree. Inventory JSON and cleanup listing never read stdin or open a popup.
+
+`branch-cleanup --list` lists pending requests for all repositories; use `inventory --target <repo> --json` for repository-scoped pending requests. Add `--json` to the cleanup listing for each request's `id`, repository/worktree paths, branch, creation time, forced-removal and provenance flags, saved outcomes, `branch_state`, `inspection_error`, and `leftover` inspection. Without `--json`, it prints one short line per request.
+
+### Confirmed removal and cleanup
+
+```sh
+python3 <plugin root>/worktree_bootstrap.py remove-worktree --target <worktree path> --confirm <token> --json
+python3 <plugin root>/worktree_bootstrap.py remove-worktree --target <worktree path> --confirm <token> --force --json
+```
+
+`--confirm` must exactly match the inventory item's `confirm_token`, including case. The primary checkout cannot be removed. The target must be an active registered worktree with verified provenance and an identifiable Herdr workspace. A dirty checkout additionally requires `--force`; this does not bypass provenance, lifecycle, or other safety checks. The plugin runs `before_remove`, rechecks dirty state, and requests removal through Herdr. Direct `herdr worktree remove` does not run this pre-remove phase.
+
+Success returns `worktree_path`, `repo_root`, `branch`, `workspace_id`, `forced`, `branch_cleanup_id`, and the `removal` result. `branch_cleanup_id` identifies the cleanup request that the asynchronous removal event will queue; it is `null` for a detached worktree. Removal does not itself delete the branch.
+
+```sh
+python3 <plugin root>/worktree_bootstrap.py branch-cleanup --target <repo> --id <cleanup-id> --decision keep --json
+python3 <plugin root>/worktree_bootstrap.py branch-cleanup --target <repo> --id <cleanup-id> --decision delete --confirm <branch> --json
+python3 <plugin root>/worktree_bootstrap.py branch-cleanup --target <repo> --id <cleanup-id> --decision force --confirm <branch> --json
+```
+
+Decision mode never reads stdin. Supply `--id`, or set `HERDR_BRANCH_CLEANUP_ID`. `keep` needs no confirmation; both `delete` (safe `git branch -d`) and `force` require the exact branch name in `--confirm`. Protected branches and branches checked out in another worktree remain undeletable. A safe-deletion refusal leaves the request pending rather than escalating to force. A branch that is already absent records `already_absent`.
+
+Branch and leftover-file decisions are independent. If checkout files remain and no `--checkout` is supplied, a successful branch decision is saved with `resolved: false` and `needs: "checkout_decision"`. Resume the same request:
+
+```sh
+python3 <plugin root>/worktree_bootstrap.py branch-cleanup --target <repo> --id <cleanup-id> --checkout keep --json
+python3 <plugin root>/worktree_bootstrap.py branch-cleanup --target <repo> --id <cleanup-id> --checkout remove --confirm-checkout <directory name> --json
+```
+
+`--checkout remove` retains all provenance, configured-root, non-Git-directory, and device/inode checks and requires the exact directory name. A branch decision and checkout decision can also be supplied in one invocation. If no branch outcome is saved and the branch still exists, `--decision` is required even when `--checkout` is supplied. An absent leftover is recorded as `absent`; keeping it records `kept`, and deleting it records `removed`. The response includes `id`, `branch`, `worktree_path`, `branch_outcome`, `checkout_outcome`, `resolved`, and `needs`. Branch outcomes are `kept`, `deleted_safely`, `deleted_forcibly`, or `already_absent`.
+
+Without `--list`, `--decision`, or `--checkout`, `branch-cleanup` retains the interactive review. `--json` alone is not a decision mode. `--list` cannot be combined with decision flags. Cleanup-only flags cannot be used with other actions; `--confirm` is shared with `remove-worktree`, and `--force` is only for `remove-worktree`.
+
+### JSON responses and exit codes
+
+`--json` is supported only by `status`, `inventory`, `remove-worktree`, and `branch-cleanup`. Each response is exactly one JSON object on stdout, followed by a newline, with `schema_version: 1`, `action`, and `ok`. Paths are strings, tuples are arrays, and absent values are `null`. Operational failures add `error: {"code": "...", "message": "..."}` with `ok: false`. Invalid control files in a status response instead appear under `copy_list` or `lifecycle`. In JSON mode, pre-remove child stdout is redirected to stderr so it cannot corrupt the response. Status intentionally exposes configured argv; do not treat its output as a secret-free log.
+
+| Error code | Meaning |
+| --- | --- |
+| `nothing_to_do` | The target is unavailable or is not an applicable Git repository; no notification is opened in JSON mode. |
+| `primary_checkout` | Removal targeted the primary checkout. |
+| `not_active` | Removal target is not an active registered inventory item. |
+| `confirmation_mismatch` | The exact branch or directory confirmation does not match. |
+| `dirty_requires_force` | Dirty worktree removal requires `--force`. |
+| `provenance_missing` | Removal lacks verified worktree provenance. |
+| `workspace_not_found` | The target has no identifiable Herdr workspace. |
+| `before_remove_failed` | A pre-remove lifecycle command failed. |
+| `dirty_after_before_remove` | The post-hook dirty-state check blocked removal. |
+| `herdr_failed` | Herdr is unavailable or refused removal. |
+| `cleanup_id_required` | Decision mode has no cleanup id. |
+| `cleanup_not_found` | The pending cleanup id does not exist yet or no longer exists. |
+| `invalid_record` | The cleanup record is invalid. |
+| `inspection_failed` | Branch inspection failed; the request remains pending. |
+| `decision_required` | An existing branch still needs a decision. |
+| `branch_protected` | The branch is protected. |
+| `branch_in_use` | Another worktree uses the branch. |
+| `safe_delete_refused` | Git refused safe deletion; the request remains pending. |
+| `force_delete_failed` | Forced branch deletion failed; the request remains pending. |
+| `checkout_delete_failed` | Leftover-file deletion failed; the request remains pending. |
+| `error` | Other operational failure. |
+
+Successful commands return exit code `0`; a partial cleanup with `resolved: false` also returns `0`. `nothing_to_do` returns `0` despite `ok: false`. Operational failures normally return `1`. Status returns `2` when either control file is invalid. Invalid flag combinations, missing required flags, and other argparse usage errors return `2` with usage text on stderr, not a JSON envelope.
+
+### Disable removal popups
+
+For unattended operation, write `settings.json` in the plugin configuration directory:
+
+```json
+{"version": 1, "branch_cleanup_popup": "never"}
+```
+
+The directory is selected in this order:
+
+1. `HERDR_PLUGIN_CONFIG_DIR`, when set;
+2. `$XDG_CONFIG_HOME/herdr/plugins/config/zerodice0.worktree-bootstrap`;
+3. `~/.config/herdr/plugins/config/zerodice0.worktree-bootstrap`.
+
+Herdr sets `HERDR_PLUGIN_CONFIG_DIR` for plugin processes; `herdr plugin list` shows it as `config:`. Configure the directory used by Herdr itself to suppress its event popups, not just the environment of a direct script invocation.
+
+`branch_cleanup_popup` accepts `"auto"` or `"never"`. A missing file or key defaults to `"auto"`. Invalid JSON, types, or values produce a warning on stderr without file contents and fall back to `"auto"`. `"never"` suppresses both the removal-event popup and notification, but still queues the request and runs `after_remove`; the event reports `queued branch cleanup for <branch>; popup=disabled` and `popup_opened: false`. Status reports the effective mode. This setting does not disable an explicitly requested interactive review.
+
+### End-to-end example
+
+After setting the removal popup mode to `"never"`, use explicit repository and worktree paths:
+
+```sh
+herdr worktree create --cwd <repo> --branch <b> --base main --path <p> --no-focus
+python3 <plugin root>/worktree_bootstrap.py status --target <p> --json
+python3 <plugin root>/worktree_bootstrap.py remove-worktree --target <p> --confirm <b> --json
+python3 <plugin root>/worktree_bootstrap.py branch-cleanup --target <repo> --id <branch_cleanup_id> --decision delete --confirm <b> --json
+```
+
+Use the `branch_cleanup_id` returned by removal. Herdr events are asynchronous: creation/bootstrap may still be running when the worktree first appears, and the cleanup request may not yet exist when removal returns. Wait for creation/bootstrap to finish before removal; on `cleanup_not_found`, briefly retry the cleanup command while the removal event catches up. Do not retry unrelated failures blindly or escalate a safe-delete refusal automatically. If files remain, make the separate `--checkout` decision above.
+
+Herdr may also create a primary workspace for the repository during `worktree create`; close that experiment-owned workspace afterward. For smoke tests, use throwaway repositories under `/tmp`, preserve user workspace focus, and never close unrelated workspaces. Direct-script experiments can use `--state-dir <temporary directory>` or `HERDR_PLUGIN_STATE_DIR`; all invocations participating in the same experiment must see the relevant records. Herdr's asynchronous event processes use their own configured plugin state directory, not a direct invocation's override.
+
 ## Worktree inventory
 
 Open **Worktree inventory and lifecycle** to reconcile three independent sources of truth:
@@ -189,7 +307,7 @@ Each row reports the branch, Git registration, path presence, provenance status,
 | `residue` | The worktree is no longer registered, but a path remains and can block recreation. |
 | `removed` | Recorded worktree, branch, and checkout path are all absent. |
 
-Inventory can start Herdr removal for an active worktree. It checks dirty state, requires typing the exact branch or directory name, runs `before_remove`, checks dirty state again, and then calls `herdr worktree remove`. A dirty checkout is removed with `--force` only after that explicit confirmation. Removal started from Herdr's built-in action or another tool cannot run `before_remove`; use Inventory when the pre-remove phase matters.
+Inventory can start Herdr removal for an active worktree. It checks dirty state, requires typing the exact branch or directory name, runs `before_remove`, checks dirty state again, and then calls `herdr worktree remove`. A dirty checkout is removed with `--force` only after that explicit confirmation. Removal started from Herdr's built-in action or another tool cannot run `before_remove`; use Inventory or the direct `remove-worktree` action when the pre-remove phase matters.
 
 Residue cleanup is a separate action from branch cleanup. It is offered only for a path whose provenance was recorded while it was a worktree. Before deletion, the plugin rechecks that the path is strictly below the absolute `[worktrees].directory`, its canonical parent has not changed, it is a real directory rather than a symbolic link, it is not registered by Git, it is not recognized as any Git repository, and it still has the displayed device/inode. The exact directory name must then be typed. Directories merely discovered by scanning the configured root are shown as `unverified` and cannot be deleted by the plugin. A residue outside the configured root remains visible but must be handled manually.
 
@@ -203,7 +321,7 @@ The source is always the primary non-bare checkout from `git worktree list --por
 
 ## Branch cleanup after worktree removal
 
-Herdr intentionally removes a worktree checkout without deleting its branch. This plugin listens for `worktree.removed`, records a pending cleanup request, inspects the local branch and checkout path independently, runs `after_remove`, and attempts to open a session-modal terminal popup.
+Herdr intentionally removes a worktree checkout without deleting its branch. This plugin listens for `worktree.removed`, records a pending cleanup request, inspects the local branch and checkout path independently, runs `after_remove`, and attempts to open a session-modal terminal popup unless `branch_cleanup_popup` is `"never"` (see [Headless and agent use](#headless-and-agent-use)).
 
 The popup shows:
 
@@ -268,7 +386,7 @@ Before validation, find and disable the old plugin:
 ```sh
 herdr plugin list
 herdr plugin disable OLD_PLUGIN_ID
-herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.5.0
+herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.6.0
 ```
 
 To roll back, disable this plugin and re-enable the previous one. Control files are left untouched:

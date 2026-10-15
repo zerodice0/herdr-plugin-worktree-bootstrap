@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## [0.6.0] - 2026-10-16
+
+- Add read-only `status --json` and `inventory --json` responses with a versioned envelope and machine-readable errors.
+- Add a `branch_cleanup_popup` setting to suppress removal-event popups and notifications while retaining queued cleanup and `after_remove` commands.
+- Add CLI-only `remove-worktree` with exact confirmation, explicit dirty-worktree force, and the same provenance and pre-remove lifecycle safeguards as Inventory.
+- Add non-interactive pending-cleanup listing, branch decisions, and separately confirmed leftover-file decisions.
+- Document direct-script agent workflows and repository safety conventions in README and AGENTS, with coverage for the headless interfaces.
+
 ## [0.5.0] - 2026-10-16
 
 - Add a Worktree Inventory action that reconciles Git registrations, local branches, recorded creation/removal provenance, and checkout paths.

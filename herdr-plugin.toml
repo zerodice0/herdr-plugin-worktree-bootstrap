@@ -1,6 +1,6 @@
 id = "zerodice0.worktree-bootstrap"
 name = "Worktree Bootstrap"
-version = "0.5.0"
+version = "0.6.0"
 min_herdr_version = "0.7.0"
 description = "Bootstrap and inventory worktrees, run lifecycle commands, and review safe cleanup."
 platforms = ["linux", "macos"]

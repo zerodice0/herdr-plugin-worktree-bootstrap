@@ -658,6 +658,12 @@ class GitRepositoryTestCase(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
+        self.config_dir = self.root / "plugin-config"
+        self.config_dir.mkdir()
+        self.config_env = {"HERDR_PLUGIN_CONFIG_DIR": os.fspath(self.config_dir)}
+        config_patch = mock.patch.dict(os.environ, self.config_env)
+        config_patch.start()
+        self.addCleanup(config_patch.stop)
         self.source = self.root / "primary checkout"
         self.target = self.root / "feature checkout"
         self.state_dir = self.root / "state"
@@ -737,7 +743,7 @@ class RepositoryResolutionTests(GitRepositoryTestCase):
                     "--state-dir",
                     os.fspath(self.state_dir),
                 ],
-                env={},
+                env=self.config_env,
             )
         self.assertEqual(result, 0)
         mapping = plugin.load_worktree_mapping(self.state_dir, self.target)
@@ -1228,6 +1234,7 @@ class LifecycleAndInventoryTests(GitRepositoryTestCase):
         plugin.record_worktree_mapping(self.context, self.state_dir)
         run(["git", "worktree", "remove", os.fspath(self.target)], cwd=self.source)
         event = {
+            **self.config_env,
             "HERDR_PLUGIN_EVENT": "worktree.removed",
             "HERDR_PLUGIN_EVENT_JSON": json.dumps(
                 {
@@ -1354,7 +1361,7 @@ class StateAndManagementTests(GitRepositoryTestCase):
         with contextlib.redirect_stdout(stdout):
             result = plugin.main(
                 ["status", "--target", os.fspath(self.target), "--state-dir", os.fspath(self.state_dir)],
-                env={},
+                env=self.config_env,
             )
         self.assertEqual(result, 2)
         self.assertIn("Copy list: INVALID", stdout.getvalue())
@@ -1391,6 +1398,7 @@ class BranchCleanupTests(GitRepositoryTestCase):
                 },
             }
         return {
+            **self.config_env,
             "HERDR_PLUGIN_EVENT": "worktree.removed",
             "HERDR_PLUGIN_EVENT_JSON": json.dumps(
                 {
@@ -1611,6 +1619,545 @@ class BranchCleanupTests(GitRepositoryTestCase):
             )
         self.assertFalse(result["popup_opened"])
         self.assertEqual(len(plugin.list_pending_cleanups(self.state_dir)), 1)
+
+
+class HeadlessCliTests(GitRepositoryTestCase):
+    removed_event = BranchCleanupTests.removed_event
+    record_and_remove_target = BranchCleanupTests.record_and_remove_target
+    branch_exists = BranchCleanupTests.branch_exists
+
+    def setUp(self):
+        super().setUp()
+        run(["git", "branch", "-M", "main"], cwd=self.source)
+        self.herdr_calls = self.root / "herdr-calls.jsonl"
+        self.before_marker = self.source / "before-marker"
+        self.fake_herdr = self.root / "fake-herdr"
+        workspace_list = {
+            "workspaces": [{"workspace_id": "w2", "cwd": os.fspath(self.target.resolve())}]
+        }
+        self.fake_herdr.write_text(
+            f"#!{sys.executable}\n"
+            "import json\n"
+            "import sys\n"
+            "from pathlib import Path\n"
+            f"log = Path({os.fspath(self.herdr_calls)!r})\n"
+            f"marker = Path({os.fspath(self.before_marker)!r})\n"
+            "with log.open('a', encoding='utf-8') as stream:\n"
+            "    stream.write(json.dumps({'argv': sys.argv[1:], "
+            "'before_marker_exists': marker.exists()}) + '\\n')\n"
+            "if sys.argv[1:] == ['workspace', 'list']:\n"
+            f"    print(json.dumps({workspace_list!r}))\n"
+            "else:\n"
+            "    print('{}')\n",
+            encoding="utf-8",
+        )
+        self.fake_herdr.chmod(0o755)
+        self.env = {
+            "HOME": os.fspath(self.root / "home"),
+            "XDG_CONFIG_HOME": os.fspath(self.root / "xdg-config"),
+            "XDG_STATE_HOME": os.fspath(self.root / "xdg-state"),
+            "HERDR_CONFIG_PATH": os.fspath(self.herdr_config),
+            "HERDR_PLUGIN_CONFIG_DIR": os.fspath(self.config_dir),
+            "HERDR_PLUGIN_STATE_DIR": os.fspath(self.state_dir),
+            "HERDR_BIN_PATH": os.fspath(self.fake_herdr),
+        }
+
+    def invoke_json(self, arguments, *, env=None):
+        effective_env = dict(self.env)
+        if env:
+            effective_env.update(env)
+        stdout = io.StringIO()
+        with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stderr:
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(
+                        mock.patch("builtins.input", side_effect=AssertionError("unexpected input"))
+                    )
+                    stack.enter_context(mock.patch.object(
+                        plugin, "review_pending_cleanups",
+                        side_effect=AssertionError("unexpected interactive cleanup review"),
+                    ))
+                    stack.enter_context(mock.patch.object(
+                        plugin, "read_single_key",
+                        side_effect=AssertionError("unexpected terminal input"),
+                    ))
+                    result = plugin.main([*arguments, "--json"], env=effective_env)
+            stderr.seek(0)
+            errors = stderr.read()
+        document = json.loads(stdout.getvalue())
+        self.assertEqual(document["schema_version"], 1)
+        self.assertEqual(document["action"], arguments[0])
+        self.assertIsInstance(document["ok"], bool)
+        self.assertTrue(stdout.getvalue().endswith("\n"))
+        return result, document, errors
+
+    def assert_cli_error(self, arguments, code):
+        result, document, _ = self.invoke_json(arguments)
+        self.assertNotEqual(result, 0)
+        self.assertFalse(document["ok"])
+        self.assertEqual(document["error"]["code"], code)
+        return document
+
+    def calls(self):
+        if not self.herdr_calls.exists():
+            return []
+        return [
+            json.loads(line)
+            for line in self.herdr_calls.read_text(encoding="utf-8").splitlines()
+        ]
+
+    def queue_removed_target(self, *, leftover=False, branch="feature"):
+        self.record_and_remove_target()
+        if leftover:
+            (self.target / "ios").mkdir(parents=True)
+            (self.target / "ios" / "cache").write_text("generated", encoding="utf-8")
+        env = dict(self.env, **self.removed_event(branch=branch))
+        with contextlib.redirect_stdout(io.StringIO()):
+            return plugin.handle_branch_cleanup_event(env, self.state_dir, open_popup=False)
+
+    def cleanup_arguments(self, pending, *arguments):
+        return ["branch-cleanup", "--id", pending["id"], *arguments]
+
+    def last_cleanup_result(self):
+        return json.loads(
+            (self.state_dir / plugin.BRANCH_CLEANUP_DIR / "last-result.json").read_text(
+                encoding="utf-8"
+            )
+        )
+
+    def test_status_json_reports_copy_eligibility_and_all_lifecycle_phases(self):
+        (self.source / ".env").write_text("secret", encoding="utf-8")
+        self.write_copy_list([".env"])
+        hooks = {
+            "on_created": [plugin.SetupCommand("create", ("create-tool", "arg"), 10)],
+            "before_remove": [plugin.SetupCommand("before", ("before-tool",), 20)],
+            "after_remove": [plugin.SetupCommand("after", ("after-tool",), 30)],
+        }
+        plugin.write_lifecycle_commands(self.context, hooks)
+        (self.config_dir / "settings.json").write_text(
+            json.dumps({"version": 1, "branch_cleanup_popup": "never"}),
+            encoding="utf-8",
+        )
+        result, document, _ = self.invoke_json(
+            ["status", "--target", os.fspath(self.target)]
+        )
+        self.assertEqual(result, 0)
+        self.assertTrue(document["ok"])
+        self.assertEqual(document["source"], os.fspath(self.source.resolve()))
+        self.assertEqual(document["target"], os.fspath(self.target.resolve()))
+        self.assertEqual(document["common_git_dir"], os.fspath(self.context.common_git_dir))
+        self.assertTrue(document["copy_list"]["valid"])
+        self.assertIsNone(document["copy_list"]["error"])
+        entry, = document["copy_list"]["entries"]
+        self.assertEqual(entry["path"], ".env")
+        self.assertTrue(entry["source_exists"])
+        self.assertFalse(entry["target_exists"])
+        self.assertEqual(entry["eligibility"], "ignored")
+        self.assertIsInstance(entry["detail"], str)
+        self.assertTrue(entry["copyable"])
+        self.assertTrue(document["lifecycle"]["valid"])
+        self.assertIsNone(document["lifecycle"]["error"])
+        for phase, commands in hooks.items():
+            command, = commands
+            self.assertEqual(
+                document["lifecycle"][phase],
+                [{
+                    "name": command.name,
+                    "argv": list(command.argv),
+                    "timeout_seconds": command.timeout_seconds,
+                }],
+            )
+        self.assertIsNone(document["last_run"])
+        self.assertEqual(document["pending_branch_cleanups"], 0)
+        self.assertEqual(document["branch_cleanup_popup"], "never")
+        self.assertEqual(self.calls(), [])
+
+    def test_status_json_invalid_setup_is_a_structured_exit_two(self):
+        control = self.source / plugin.SETUP_FILE
+        control.parent.mkdir(parents=True)
+        control.write_text("{", encoding="utf-8")
+        result, document, _ = self.invoke_json(
+            ["status", "--target", os.fspath(self.target)]
+        )
+        self.assertEqual(result, 2)
+        self.assertFalse(document["ok"])
+        self.assertFalse(document["lifecycle"]["valid"])
+        self.assertIsInstance(document["lifecycle"]["error"], str)
+        for phase in ("on_created", "before_remove", "after_remove"):
+            self.assertEqual(document["lifecycle"][phase], [])
+
+    def test_inventory_json_is_noninteractive_and_filters_pending_by_repository(self):
+        pending = self.queue_removed_target()
+        active_path = self.root / "active checkout"
+        run(["git", "worktree", "add", "-qb", "active", os.fspath(active_path)], cwd=self.source)
+        other_repo = self.root / "other repository"
+        run(["git", "clone", "-q", os.fspath(self.source), os.fspath(other_repo)])
+        foreign_event = self.removed_event(branch="main")
+        envelope = json.loads(foreign_event["HERDR_PLUGIN_EVENT_JSON"])
+        envelope["data"]["workspace"]["worktree"]["repo_root"] = os.fspath(other_repo)
+        envelope["data"]["worktree"]["path"] = os.fspath(self.root / "foreign checkout")
+        foreign_event["HERDR_PLUGIN_EVENT_JSON"] = json.dumps(envelope)
+        foreign = plugin.queue_branch_cleanup(foreign_event, self.state_dir)
+        result, document, _ = self.invoke_json(
+            ["inventory", "--target", os.fspath(self.source)]
+        )
+        self.assertEqual(result, 0)
+        self.assertTrue(document["ok"])
+        self.assertEqual(document["repo_root"], os.fspath(self.source.resolve()))
+        self.assertEqual(document["worktree_root"], os.fspath(self.root.resolve()))
+        items = {item["worktree_path"]: item for item in document["items"]}
+        primary = items[os.fspath(self.source.resolve())]
+        self.assertFalse(primary["removable"])
+        self.assertEqual(primary["confirm_token"], "main")
+        active = items[os.fspath(active_path.resolve())]
+        self.assertTrue(active["removable"])
+        self.assertEqual(active["confirm_token"], "active")
+        self.assertTrue(active["registered"])
+        self.assertTrue(active["leftover"]["exists"])
+        removed = items[os.fspath(self.target.resolve())]
+        self.assertFalse(removed["removable"])
+        self.assertEqual(removed["confirm_token"], "feature")
+        self.assertFalse(removed["leftover"]["exists"])
+        self.assertEqual(
+            [item["id"] for item in document["pending_branch_cleanups"]],
+            [pending["id"]],
+        )
+        self.assertNotEqual(pending["id"], foreign["id"])
+        self.assertEqual(len(plugin.list_pending_cleanups(self.state_dir)), 2)
+
+    def test_bootstrap_rejects_json_before_making_changes(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                plugin.main(
+                    ["bootstrap", "--target", os.fspath(self.target), "--json"],
+                    env=self.env,
+                )
+        self.assertEqual(raised.exception.code, 2)
+        self.assertFalse(self.state_dir.exists())
+
+    def test_popup_never_still_queues_and_runs_after_remove_without_herdr(self):
+        plugin.write_lifecycle_commands(
+            self.context,
+            {
+                "on_created": [],
+                "before_remove": [],
+                "after_remove": [plugin.SetupCommand(
+                    "after",
+                    (sys.executable, "-c", "from pathlib import Path; Path('after-marker').touch()"),
+                    5,
+                )],
+            },
+        )
+        self.record_and_remove_target()
+        (self.config_dir / "settings.json").write_text(
+            json.dumps({"version": 1, "branch_cleanup_popup": "never"}),
+            encoding="utf-8",
+        )
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            pending = plugin.handle_branch_cleanup_event(
+                dict(self.env, **self.removed_event()), self.state_dir
+            )
+        self.assertFalse(pending["popup_opened"])
+        self.assertTrue(plugin.pending_cleanup_path(self.state_dir, pending["id"]).exists())
+        self.assertTrue((self.source / "after-marker").exists())
+        self.assertEqual(self.calls(), [])
+        self.assertIn("popup=disabled", stdout.getvalue())
+
+    def test_invalid_popup_settings_fall_back_to_opening_popup(self):
+        self.record_and_remove_target()
+        for settings in (
+            "{",
+            json.dumps({"version": 1, "branch_cleanup_popup": []}),
+            json.dumps({"version": 1, "branch_cleanup_popup": "sometimes"}),
+        ):
+            with self.subTest(settings=settings):
+                (self.config_dir / "settings.json").write_text(settings, encoding="utf-8")
+                previous_calls = len(self.calls())
+                with contextlib.redirect_stdout(io.StringIO()):
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        pending = plugin.handle_branch_cleanup_event(
+                            dict(self.env, **self.removed_event()), self.state_dir
+                        )
+                self.assertTrue(pending["popup_opened"])
+                new_calls = self.calls()[previous_calls:]
+                popup_calls = [
+                    call for call in new_calls
+                    if call["argv"][:3] == ["plugin", "pane", "open"]
+                ]
+                self.assertEqual(len(popup_calls), 1)
+                popup_arguments = popup_calls[0]["argv"]
+                self.assertEqual(popup_arguments[popup_arguments.index("--placement") + 1], "popup")
+                self.assertTrue(plugin.pending_cleanup_path(self.state_dir, pending["id"]).exists())
+
+    def test_remove_worktree_confirmation_mismatch_never_calls_herdr(self):
+        plugin.record_worktree_mapping(self.context, self.state_dir)
+        self.assert_cli_error(
+            ["remove-worktree", "--target", os.fspath(self.target), "--confirm", "wrong"],
+            "confirmation_mismatch",
+        )
+        self.assertEqual(self.calls(), [])
+        self.assertTrue(self.target.exists())
+        self.assertTrue((self.target / ".git").exists())
+
+    def test_remove_worktree_dirty_checkout_requires_force(self):
+        plugin.record_worktree_mapping(self.context, self.state_dir)
+        (self.target / "untracked").write_text("keep", encoding="utf-8")
+        self.assert_cli_error(
+            ["remove-worktree", "--target", os.fspath(self.target), "--confirm", "feature"],
+            "dirty_requires_force",
+        )
+        self.assertEqual(self.calls(), [])
+        self.assertTrue((self.target / "untracked").exists())
+
+    def test_remove_worktree_rejects_primary_checkout(self):
+        self.assert_cli_error(
+            ["remove-worktree", "--target", os.fspath(self.source), "--confirm", "main"],
+            "primary_checkout",
+        )
+        self.assertEqual(self.calls(), [])
+        self.assertTrue((self.source / "tracked.txt").exists())
+
+    def test_remove_worktree_runs_hook_before_herdr_and_returns_event_cleanup_id(self):
+        plugin.write_lifecycle_commands(
+            self.context,
+            {
+                "on_created": [],
+                "before_remove": [plugin.SetupCommand(
+                    "before",
+                    (
+                        sys.executable,
+                        "-c",
+                        "from pathlib import Path; "
+                        f"Path({os.fspath(self.before_marker)!r}).touch(); "
+                        "print('lifecycle-output', flush=True)",
+                    ),
+                    5,
+                )],
+                "after_remove": [],
+            },
+        )
+        plugin.record_worktree_mapping(self.context, self.state_dir)
+        result, document, errors = self.invoke_json(
+            ["remove-worktree", "--target", os.fspath(self.target), "--confirm", "feature"]
+        )
+        self.assertEqual(result, 0)
+        self.assertTrue(document["ok"])
+        self.assertEqual(document["worktree_path"], os.fspath(self.target.resolve()))
+        self.assertEqual(document["repo_root"], os.fspath(self.source.resolve()))
+        self.assertEqual(document["branch"], "feature")
+        self.assertEqual(document["workspace_id"], "w2")
+        self.assertFalse(document["forced"])
+        self.assertEqual(document["removal"]["removal_operation_status"], "requested")
+        self.assertEqual(document["removal"]["before_remove_status"], "success")
+        self.assertIn("lifecycle-output", errors)
+        removal_calls = [
+            call for call in self.calls()
+            if call["argv"][:2] == ["worktree", "remove"]
+        ]
+        self.assertEqual(len(removal_calls), 1)
+        self.assertEqual(removal_calls[0]["argv"], ["worktree", "remove", "--workspace", "w2"])
+        self.assertTrue(removal_calls[0]["before_marker_exists"])
+        run(["git", "worktree", "remove", os.fspath(self.target)], cwd=self.source)
+        with contextlib.redirect_stdout(io.StringIO()):
+            pending = plugin.handle_branch_cleanup_event(
+                dict(self.env, **self.removed_event()), self.state_dir, open_popup=False
+            )
+        self.assertEqual(document["branch_cleanup_id"], pending["id"])
+        self.assertTrue(plugin.pending_cleanup_path(self.state_dir, pending["id"]).exists())
+
+    def test_branch_cleanup_list_includes_current_branch_and_leftover_state(self):
+        pending = self.queue_removed_target()
+        result, document, _ = self.invoke_json(["branch-cleanup", "--list"])
+        self.assertEqual(result, 0)
+        self.assertTrue(document["ok"])
+        listed, = document["pending"]
+        self.assertEqual(listed["id"], pending["id"])
+        self.assertEqual(listed["repo_root"], os.fspath(self.source.resolve()))
+        self.assertEqual(listed["branch"], "feature")
+        self.assertTrue(listed["branch_state"]["exists"])
+        self.assertFalse(listed["branch_state"]["protected"])
+        self.assertTrue(listed["branch_state"]["merged_into_default"])
+        self.assertEqual(listed["branch_state"]["used_by_worktrees"], [])
+        self.assertIsNone(listed["inspection_error"])
+        self.assertFalse(listed["leftover"]["exists"])
+        self.assertIsNone(listed["branch_outcome"])
+        self.assertIsNone(listed["checkout_outcome"])
+        self.assertTrue(plugin.pending_cleanup_path(self.state_dir, pending["id"]).exists())
+
+    def test_branch_cleanup_keep_resolves_request_and_writes_last_result(self):
+        pending = self.queue_removed_target()
+        result, document, _ = self.invoke_json(
+            self.cleanup_arguments(pending, "--decision", "keep")
+        )
+        self.assertEqual(result, 0)
+        self.assertTrue(document["ok"])
+        self.assertTrue(document["resolved"])
+        self.assertEqual(document["id"], pending["id"])
+        self.assertEqual(document["branch_outcome"], "kept")
+        self.assertEqual(document["checkout_outcome"], "absent")
+        self.assertIsNone(document["needs"])
+        self.assertTrue(self.branch_exists("feature"))
+        self.assertFalse(plugin.pending_cleanup_path(self.state_dir, pending["id"]).exists())
+        self.assertEqual(self.last_cleanup_result()["outcome"], "kept")
+
+    def test_branch_cleanup_delete_requires_exact_branch_confirmation(self):
+        pending = self.queue_removed_target()
+        self.assert_cli_error(
+            self.cleanup_arguments(pending, "--decision", "delete", "--confirm", "Feature"),
+            "confirmation_mismatch",
+        )
+        self.assertTrue(self.branch_exists("feature"))
+        self.assertTrue(plugin.pending_cleanup_path(self.state_dir, pending["id"]).exists())
+
+    def test_branch_cleanup_deletes_merged_branch_safely(self):
+        pending = self.queue_removed_target()
+        result, document, _ = self.invoke_json(
+            self.cleanup_arguments(pending, "--decision", "delete", "--confirm", "feature")
+        )
+        self.assertEqual(result, 0)
+        self.assertTrue(document["ok"])
+        self.assertTrue(document["resolved"])
+        self.assertEqual(document["branch_outcome"], "deleted_safely")
+        self.assertFalse(self.branch_exists("feature"))
+        self.assertFalse(plugin.pending_cleanup_path(self.state_dir, pending["id"]).exists())
+        self.assertEqual(self.last_cleanup_result()["outcome"], "deleted_safely")
+
+    def test_branch_cleanup_refuses_unmerged_delete_then_accepts_confirmed_force(self):
+        (self.target / "feature-only").write_text("unmerged", encoding="utf-8")
+        run(["git", "add", "feature-only"], cwd=self.target)
+        run(["git", "commit", "-qm", "feature only"], cwd=self.target)
+        pending = self.queue_removed_target()
+        self.assert_cli_error(
+            self.cleanup_arguments(pending, "--decision", "delete", "--confirm", "feature"),
+            "safe_delete_refused",
+        )
+        self.assertTrue(self.branch_exists("feature"))
+        self.assertTrue(plugin.pending_cleanup_path(self.state_dir, pending["id"]).exists())
+        self.assertEqual(self.last_cleanup_result()["outcome"], "safe_delete_failed")
+        self.assert_cli_error(
+            self.cleanup_arguments(pending, "--decision", "force", "--confirm", "wrong"),
+            "confirmation_mismatch",
+        )
+        self.assertTrue(self.branch_exists("feature"))
+        result, document, _ = self.invoke_json(
+            self.cleanup_arguments(pending, "--decision", "force", "--confirm", "feature")
+        )
+        self.assertEqual(result, 0)
+        self.assertTrue(document["ok"])
+        self.assertTrue(document["resolved"])
+        self.assertEqual(document["branch_outcome"], "deleted_forcibly")
+        self.assertFalse(self.branch_exists("feature"))
+        self.assertFalse(plugin.pending_cleanup_path(self.state_dir, pending["id"]).exists())
+        self.assertEqual(self.last_cleanup_result()["outcome"], "deleted_forcibly")
+
+    def test_branch_cleanup_never_deletes_protected_branch(self):
+        pending = self.queue_removed_target(branch="main")
+        self.assert_cli_error(
+            self.cleanup_arguments(pending, "--decision", "force", "--confirm", "main"),
+            "branch_protected",
+        )
+        self.assertTrue(self.branch_exists("main"))
+        self.assertTrue((self.source / "tracked.txt").exists())
+        self.assertTrue(plugin.pending_cleanup_path(self.state_dir, pending["id"]).exists())
+
+    def test_branch_cleanup_persists_branch_decision_before_later_checkout_keep(self):
+        pending = self.queue_removed_target(leftover=True)
+        result, document, _ = self.invoke_json(
+            self.cleanup_arguments(pending, "--decision", "delete", "--confirm", "feature")
+        )
+        self.assertEqual(result, 0)
+        self.assertTrue(document["ok"])
+        self.assertFalse(document["resolved"])
+        self.assertEqual(document["needs"], "checkout_decision")
+        self.assertEqual(document["branch_outcome"], "deleted_safely")
+        self.assertIsNone(document["checkout_outcome"])
+        self.assertFalse(self.branch_exists("feature"))
+        saved = json.loads(
+            plugin.pending_cleanup_path(self.state_dir, pending["id"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(saved["branch_outcome"], "deleted_safely")
+        result, document, _ = self.invoke_json(
+            self.cleanup_arguments(pending, "--checkout", "keep")
+        )
+        self.assertEqual(result, 0)
+        self.assertTrue(document["ok"])
+        self.assertTrue(document["resolved"])
+        self.assertEqual(document["branch_outcome"], "deleted_safely")
+        self.assertEqual(document["checkout_outcome"], "kept")
+        self.assertTrue((self.target / "ios" / "cache").exists())
+        self.assertFalse(plugin.pending_cleanup_path(self.state_dir, pending["id"]).exists())
+        self.assertEqual(self.last_cleanup_result()["outcome"], "kept_with_leftover_files")
+
+    def test_branch_cleanup_removes_confirmed_leftover_under_configured_root(self):
+        pending = self.queue_removed_target(leftover=True)
+        self.assert_cli_error(
+            self.cleanup_arguments(
+                pending, "--decision", "keep", "--checkout", "remove",
+                "--confirm-checkout", "wrong",
+            ),
+            "confirmation_mismatch",
+        )
+        self.assertTrue((self.target / "ios" / "cache").exists())
+        saved = json.loads(
+            plugin.pending_cleanup_path(self.state_dir, pending["id"]).read_text(encoding="utf-8")
+        )
+        self.assertIsNone(saved.get("branch_outcome"))
+        result, document, _ = self.invoke_json(
+            self.cleanup_arguments(
+                pending, "--decision", "keep", "--checkout", "remove",
+                "--confirm-checkout", self.target.name,
+            )
+        )
+        self.assertEqual(result, 0)
+        self.assertTrue(document["ok"])
+        self.assertTrue(document["resolved"])
+        self.assertEqual(document["branch_outcome"], "kept")
+        self.assertEqual(document["checkout_outcome"], "removed")
+        self.assertFalse(self.target.exists())
+        self.assertTrue(self.branch_exists("feature"))
+        self.assertFalse(plugin.pending_cleanup_path(self.state_dir, pending["id"]).exists())
+
+    def test_branch_cleanup_rejects_checkout_confirmation_before_deleting_branch(self):
+        pending = self.queue_removed_target(leftover=True)
+        self.assertTrue(plugin.inspect_branch(self.source, "feature").merged_into_default)
+        self.assert_cli_error(
+            self.cleanup_arguments(
+                pending, "--decision", "delete", "--confirm", "feature",
+                "--checkout", "remove", "--confirm-checkout", "wrong",
+            ),
+            "confirmation_mismatch",
+        )
+        self.assertTrue(self.branch_exists("feature"))
+        self.assertTrue((self.target / "ios" / "cache").exists())
+        saved = json.loads(
+            plugin.pending_cleanup_path(self.state_dir, pending["id"]).read_text(encoding="utf-8")
+        )
+        self.assertIsNone(saved.get("branch_outcome"))
+
+    def test_branch_cleanup_requires_id_for_noninteractive_decision(self):
+        self.assert_cli_error(
+            ["branch-cleanup", "--decision", "keep"],
+            "cleanup_id_required",
+        )
+
+    def test_branch_cleanup_unknown_id_is_structured_error(self):
+        self.assert_cli_error(
+            ["branch-cleanup", "--id", "a" * 24, "--decision", "keep"],
+            "cleanup_not_found",
+        )
+
+    def test_branch_cleanup_accepts_id_from_event_environment(self):
+        pending = self.queue_removed_target()
+        result, document, _ = self.invoke_json(
+            ["branch-cleanup", "--decision", "keep"],
+            env={"HERDR_BRANCH_CLEANUP_ID": pending["id"]},
+        )
+        self.assertEqual(result, 0)
+        self.assertTrue(document["ok"])
+        self.assertTrue(document["resolved"])
+        self.assertEqual(document["id"], pending["id"])
+        self.assertFalse(plugin.pending_cleanup_path(self.state_dir, pending["id"]).exists())
 
 
 if __name__ == "__main__":

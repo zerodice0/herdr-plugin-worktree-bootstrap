@@ -41,11 +41,15 @@ TXN_PREFIX = ".herdr-worktree-bootstrap-txn-"
 BRANCH_CLEANUP_DIR = "branch-cleanup"
 WORKTREE_MAP_DIR = "worktree-map"
 PROTECTED_BRANCHES = frozenset({"main", "master", "develop", "development", "trunk"})
+LIFECYCLE_PHASES = ("on_created", "before_remove", "after_remove")
+LEFTOVER_SAMPLE_LIMIT = 8
+LEFTOVER_ENTRY_LIMIT = 10_000
 ANSI_RESET = "\033[0m"
 MIN_ACTION_FOOTER_COLUMNS = 32
 ACTION_GROUP_GAP = 4
 MANAGE_POPUP_SIZE = ("96", "24")
 SETUP_MANAGE_POPUP_SIZE = ("84", "20")
+INVENTORY_POPUP_SIZE = ("104", "30")
 ColorValue = Optional[Union[int, Tuple[int, int, int]]]
 ActionSpec = Tuple[str, str, str]
 
@@ -128,6 +132,42 @@ class BranchInspection:
     behind: Optional[int]
     last_commit: Optional[str]
     head_oid: Optional[str]
+
+
+@dataclasses.dataclass(frozen=True)
+class LeftoverInspection:
+    path: Path
+    exists: bool
+    is_directory: bool
+    is_symlink: bool
+    entry_count: int
+    total_bytes: int
+    sample_paths: Tuple[str, ...]
+    truncated: bool
+    device: Optional[int]
+    inode: Optional[int]
+
+
+@dataclasses.dataclass(frozen=True)
+class WorktreeInventoryItem:
+    repo_root: Path
+    worktree_path: Path
+    branch: Optional[str]
+    head_oid: Optional[str]
+    created_head_oid: Optional[str]
+    base_candidates: Tuple[str, ...]
+    registered: bool
+    path_exists: bool
+    branch_exists: Optional[bool]
+    status: str
+    provenance_verified: bool
+    workspace_id: Optional[str]
+    forced_removal: bool
+    removed_at: Optional[str]
+    on_created_status: Optional[str]
+    before_remove_status: Optional[str]
+    after_remove_status: Optional[str]
+    leftover: LeftoverInspection
 
 
 @dataclasses.dataclass(frozen=True)
@@ -432,6 +472,39 @@ def load_theme_settings(
     )
 
 
+def load_worktree_directory(
+    env: Mapping[str, str],
+    *,
+    config_path: Optional[Path] = None,
+) -> Optional[Path]:
+    path = config_path if config_path is not None else _theme_config_path(env)
+    configured: Optional[str] = None
+    try:
+        contents = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        contents = ""
+    section = ""
+    for raw_line in contents.splitlines():
+        line = _strip_toml_comment(raw_line)
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip()
+            continue
+        if section != "worktrees" or "=" not in line:
+            continue
+        raw_key, raw_value = line.split("=", 1)
+        if raw_key.strip() != "directory":
+            continue
+        parsed = _parse_theme_scalar(raw_value)
+        if isinstance(parsed, str) and parsed.strip():
+            configured = parsed
+    candidate = Path(configured or "~/.herdr/worktrees").expanduser()
+    if not candidate.is_absolute():
+        return None
+    return _canonical(candidate)
+
+
 def _theme_siblings(name: str) -> Tuple[str, str]:
     normalized = HERDR_THEME_ALIASES.get(_normalize_theme_name(name), _normalize_theme_name(name))
     if normalized in ("catppuccin", "catppuccin-latte"):
@@ -591,6 +664,13 @@ def _run_git(
 
 def _canonical(path: Path) -> Path:
     return Path(os.path.realpath(os.fspath(path)))
+
+
+def _absolute_path(path: Path) -> Path:
+    """Resolve parent aliases without following a possibly replaced final symlink."""
+
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    return _canonical(absolute.parent) / absolute.name
 
 
 def _git_common_dir(worktree: Path) -> Path:
@@ -972,42 +1052,73 @@ def sync_paths(context: RepositoryContext, statuses: Sequence[CopyEntryStatus]) 
             _remove_object(transaction)
 
 
-def load_setup_commands(source: Path) -> List[SetupCommand]:
+def _parse_lifecycle_command_list(raw_commands: Any, label: str) -> List[SetupCommand]:
+    if not isinstance(raw_commands, list):
+        raise BootstrapError(f"{label} commands must be an array")
+    commands: List[SetupCommand] = []
+    allowed = {"name", "argv", "timeout_seconds"}
+    for index, raw in enumerate(raw_commands):
+        command_label = f"{label} command {index + 1}"
+        if not isinstance(raw, dict) or set(raw) != allowed:
+            raise BootstrapError(
+                f"{command_label} must contain only name, argv, and timeout_seconds"
+            )
+        name = raw["name"]
+        argv = raw["argv"]
+        timeout = raw["timeout_seconds"]
+        if not isinstance(name, str) or not name.strip():
+            raise BootstrapError(f"{command_label} name must be a non-empty string")
+        if not isinstance(argv, list) or not argv or not all(isinstance(arg, str) for arg in argv):
+            raise BootstrapError(f"{command_label} argv must be a non-empty array of strings")
+        if not argv[0]:
+            raise BootstrapError(f"{command_label} executable cannot be empty")
+        if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0:
+            raise BootstrapError(f"{command_label} timeout_seconds must be a positive integer")
+        commands.append(SetupCommand(name=name.strip(), argv=tuple(argv), timeout_seconds=timeout))
+    return commands
+
+
+def load_lifecycle_commands(source: Path) -> Mapping[str, List[SetupCommand]]:
     path = source / SETUP_FILE
     if not path.exists():
-        return []
+        return {phase: [] for phase in LIFECYCLE_PHASES}
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise BootstrapError(f"{SETUP_FILE} is invalid JSON at line {exc.lineno}: {exc.msg}") from exc
     except (OSError, UnicodeError) as exc:
         raise BootstrapError(f"cannot read {SETUP_FILE}: {exc}") from exc
-    if not isinstance(document, dict) or set(document) != {"version", "commands"}:
-        raise BootstrapError(f"{SETUP_FILE} must contain only 'version' and 'commands'")
-    if document["version"] != 1 or isinstance(document["version"], bool):
-        raise BootstrapError(f"{SETUP_FILE} version must be 1")
-    if not isinstance(document["commands"], list):
-        raise BootstrapError(f"{SETUP_FILE} commands must be an array")
+    if not isinstance(document, dict):
+        raise BootstrapError(f"{SETUP_FILE} must contain a JSON object")
+    version = document.get("version")
+    if isinstance(version, bool):
+        raise BootstrapError(f"{SETUP_FILE} version must be 1 or 2")
+    if version == 1:
+        if set(document) != {"version", "commands"}:
+            raise BootstrapError(f"{SETUP_FILE} must contain only 'version' and 'commands'")
+        result = {phase: [] for phase in LIFECYCLE_PHASES}
+        result["on_created"] = _parse_lifecycle_command_list(
+            document["commands"], os.fspath(SETUP_FILE)
+        )
+        return result
+    if version != 2:
+        raise BootstrapError(f"{SETUP_FILE} version must be 1 or 2")
+    if set(document) != {"version", "hooks"} or not isinstance(document.get("hooks"), dict):
+        raise BootstrapError(f"{SETUP_FILE} version 2 must contain only 'version' and 'hooks'")
+    hooks = document["hooks"]
+    unknown = set(hooks) - set(LIFECYCLE_PHASES)
+    if unknown:
+        raise BootstrapError(f"{SETUP_FILE} has unknown lifecycle hook: {sorted(unknown)[0]}")
+    return {
+        phase: _parse_lifecycle_command_list(
+            hooks.get(phase, []), f"{SETUP_FILE} {phase}"
+        )
+        for phase in LIFECYCLE_PHASES
+    }
 
-    commands: List[SetupCommand] = []
-    allowed = {"name", "argv", "timeout_seconds"}
-    for index, raw in enumerate(document["commands"]):
-        label = f"{SETUP_FILE} command {index + 1}"
-        if not isinstance(raw, dict) or set(raw) != allowed:
-            raise BootstrapError(f"{label} must contain only name, argv, and timeout_seconds")
-        name = raw["name"]
-        argv = raw["argv"]
-        timeout = raw["timeout_seconds"]
-        if not isinstance(name, str) or not name.strip():
-            raise BootstrapError(f"{label} name must be a non-empty string")
-        if not isinstance(argv, list) or not argv or not all(isinstance(arg, str) for arg in argv):
-            raise BootstrapError(f"{label} argv must be a non-empty array of strings")
-        if not argv[0]:
-            raise BootstrapError(f"{label} executable cannot be empty")
-        if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0:
-            raise BootstrapError(f"{label} timeout_seconds must be a positive integer")
-        commands.append(SetupCommand(name=name, argv=tuple(argv), timeout_seconds=timeout))
-    return commands
+
+def load_setup_commands(source: Path) -> List[SetupCommand]:
+    return list(load_lifecycle_commands(source)["on_created"])
 
 
 def _terminate_process_group(process: subprocess.Popen) -> None:
@@ -1021,26 +1132,39 @@ def _terminate_process_group(process: subprocess.Popen) -> None:
         process.wait()
 
 
-def run_setup_commands(target: Path, commands: Sequence[SetupCommand]) -> int:
+def run_lifecycle_commands(
+    target: Path,
+    commands: Sequence[SetupCommand],
+    *,
+    phase: str,
+    environment: Optional[Mapping[str, str]] = None,
+) -> int:
+    if phase not in LIFECYCLE_PHASES:
+        raise BootstrapError(f"unknown lifecycle phase: {phase}")
+    phase_label = "setup" if phase == "on_created" else phase.replace("_", "-")
+    child_env = os.environ.copy()
+    if environment:
+        child_env.update({key: value for key, value in environment.items() if isinstance(value, str)})
     completed_count = 0
     for index, command in enumerate(commands, 1):
-        print(f"setup {index}/{len(commands)}: {command.name}", flush=True)
+        print(f"{phase_label} {index}/{len(commands)}: {command.name}", flush=True)
         try:
             process = subprocess.Popen(
                 list(command.argv),
                 cwd=os.fspath(target),
                 start_new_session=True,
+                env=child_env,
             )
         except FileNotFoundError as exc:
             raise SetupCommandError(
-                f"setup command {index} ({command.name}) executable not found: {command.argv[0]}",
+                f"{phase_label} command {index} ({command.name}) executable not found: {command.argv[0]}",
                 command_index=index,
                 command_name=command.name,
                 failure_kind="executable_not_found",
             ) from exc
         except OSError as exc:
             raise SetupCommandError(
-                f"setup command {index} ({command.name}) could not start: {exc}",
+                f"{phase_label} command {index} ({command.name}) could not start: {exc}",
                 command_index=index,
                 command_name=command.name,
                 failure_kind="start_failed",
@@ -1050,7 +1174,7 @@ def run_setup_commands(target: Path, commands: Sequence[SetupCommand]) -> int:
         except subprocess.TimeoutExpired as exc:
             _terminate_process_group(process)
             raise SetupCommandError(
-                f"setup command {index} ({command.name}) timed out after {command.timeout_seconds}s",
+                f"{phase_label} command {index} ({command.name}) timed out after {command.timeout_seconds}s",
                 command_index=index,
                 command_name=command.name,
                 failure_kind="timeout",
@@ -1060,7 +1184,7 @@ def run_setup_commands(target: Path, commands: Sequence[SetupCommand]) -> int:
             raise
         if return_code != 0:
             raise SetupCommandError(
-                f"setup command {index} ({command.name}) failed with exit code {return_code}",
+                f"{phase_label} command {index} ({command.name}) failed with exit code {return_code}",
                 command_index=index,
                 command_name=command.name,
                 failure_kind="nonzero_exit",
@@ -1068,6 +1192,10 @@ def run_setup_commands(target: Path, commands: Sequence[SetupCommand]) -> int:
             )
         completed_count += 1
     return completed_count
+
+
+def run_setup_commands(target: Path, commands: Sequence[SetupCommand]) -> int:
+    return run_lifecycle_commands(target, commands, phase="on_created")
 
 
 def default_state_dir(env: Mapping[str, str]) -> Path:
@@ -1104,7 +1232,7 @@ def _read_json_file(path: Path) -> Optional[Mapping[str, Any]]:
 
 
 def _path_state_key(path: Path) -> str:
-    encoded = os.fspath(_canonical(path)).encode("utf-8", "surrogateescape")
+    encoded = os.fspath(_absolute_path(path)).encode("utf-8", "surrogateescape")
     return hashlib.sha256(encoded).hexdigest()[:24]
 
 
@@ -1112,7 +1240,53 @@ def worktree_map_path(state_dir: Path, target: Path) -> Path:
     return state_dir / WORKTREE_MAP_DIR / f"{_path_state_key(target)}.json"
 
 
-def record_worktree_mapping(context: RepositoryContext, state_dir: Path) -> None:
+def _workspace_id_from_env(env: Mapping[str, str]) -> Optional[str]:
+    for name in ("HERDR_PLUGIN_EVENT_JSON", "HERDR_PLUGIN_CONTEXT_JSON"):
+        document = _decode_json_env(env, name)
+        if not isinstance(document, dict):
+            continue
+        for keys in (
+            ("data", "workspace_id"),
+            ("data", "workspace", "workspace_id"),
+            ("workspace_id",),
+            ("workspace", "workspace_id"),
+            ("workspace", "id"),
+        ):
+            value = _nested_string(document, keys)
+            if value:
+                return value
+    return None
+
+
+def _refs_pointing_at(repo_root: Path, oid: str, branch: Optional[str]) -> List[str]:
+    result = _run_git(
+        repo_root,
+        [
+            "for-each-ref",
+            "--format=%(refname:short)",
+            f"--points-at={oid}",
+            "refs/heads",
+            "refs/remotes",
+        ],
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+    return sorted(
+        {
+            value.strip()
+            for value in result.stdout.splitlines()
+            if value.strip() and value.strip() != branch
+        }
+    )
+
+
+def record_worktree_mapping(
+    context: RepositoryContext,
+    state_dir: Path,
+    *,
+    env: Optional[Mapping[str, str]] = None,
+) -> None:
     if context.target_is_primary:
         return
     branch_result = _run_git(
@@ -1121,13 +1295,37 @@ def record_worktree_mapping(context: RepositoryContext, state_dir: Path) -> None
         check=False,
     )
     branch = branch_result.stdout.strip() if branch_result.returncode == 0 else None
+    oid_result = _run_git(context.target, ["rev-parse", "--verify", "HEAD"], check=False)
+    head_oid = oid_result.stdout.strip() if oid_result.returncode == 0 else None
+    existing = load_worktree_mapping(state_dir, context.target)
+    preserve_creation = (
+        isinstance(existing, dict)
+        and existing.get("status", "active") == "active"
+        and existing.get("common_git_dir") == os.fspath(context.common_git_dir)
+    )
+    workspace_id = _workspace_id_from_env(env or {})
     payload: Dict[str, Any] = {
-        "version": 1,
+        "version": 2,
         "target": os.fspath(context.target),
         "repo_root": os.fspath(context.source),
         "common_git_dir": os.fspath(context.common_git_dir),
         "branch": branch or None,
-        "recorded_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "created_head_oid": (
+            existing.get("created_head_oid") if preserve_creation else head_oid
+        ),
+        "base_candidates": (
+            existing.get("base_candidates", [])
+            if preserve_creation
+            else (_refs_pointing_at(context.source, head_oid, branch) if head_oid else [])
+        ),
+        "workspace_id": workspace_id or (existing.get("workspace_id") if preserve_creation else None),
+        "recorded_at": (
+            existing.get("recorded_at")
+            if preserve_creation
+            else dt.datetime.now(dt.timezone.utc).isoformat()
+        ),
+        "status": "active",
+        "provenance_verified": True,
     }
     _atomic_write_json(worktree_map_path(state_dir, context.target), payload)
 
@@ -1136,12 +1334,368 @@ def load_worktree_mapping(state_dir: Path, target: Path) -> Optional[Mapping[str
     return _read_json_file(worktree_map_path(state_dir, target))
 
 
+def list_worktree_mappings(state_dir: Path) -> List[Mapping[str, Any]]:
+    directory = state_dir / WORKTREE_MAP_DIR
+    if not directory.exists():
+        return []
+    records: List[Mapping[str, Any]] = []
+    for path in sorted(directory.glob("*.json")):
+        document = _read_json_file(path)
+        if document is not None:
+            records.append(dict(document))
+    return records
+
+
+def mark_worktree_removed(
+    state_dir: Path,
+    worktree_path: Path,
+    repo_root: Path,
+    *,
+    common_git_dir: Optional[Path],
+    branch: Optional[str],
+    forced: bool,
+) -> Mapping[str, Any]:
+    existing = load_worktree_mapping(state_dir, worktree_path)
+    common_value = os.fspath(common_git_dir) if common_git_dir is not None else None
+    verified = bool(
+        isinstance(existing, dict)
+        and isinstance(existing.get("common_git_dir"), str)
+        and common_value is not None
+        and _canonical(Path(str(existing["common_git_dir"]))) == _canonical(common_git_dir)
+    )
+    now = dt.datetime.now(dt.timezone.utc).isoformat()
+    payload: Dict[str, Any] = dict(existing) if isinstance(existing, dict) else {}
+    payload.update(
+        {
+            "version": 2,
+            "target": os.fspath(_absolute_path(worktree_path)),
+            "repo_root": os.fspath(_canonical(repo_root)),
+            "common_git_dir": common_value or payload.get("common_git_dir"),
+            "branch": branch,
+            "status": "removed",
+            "removed_at": now,
+            "forced_removal": forced,
+            "provenance_verified": verified,
+        }
+    )
+    if "recorded_at" not in payload:
+        payload["recorded_at"] = now
+    _atomic_write_json(worktree_map_path(state_dir, worktree_path), payload)
+    return payload
+
+
+def inspect_leftover_path(path: Path) -> LeftoverInspection:
+    path = _absolute_path(path)
+    try:
+        root_stat = path.lstat()
+    except FileNotFoundError:
+        return LeftoverInspection(path, False, False, False, 0, 0, (), False, None, None)
+    except OSError:
+        return LeftoverInspection(path, True, False, False, 0, 0, (), True, None, None)
+    is_symlink = stat.S_ISLNK(root_stat.st_mode)
+    is_directory = stat.S_ISDIR(root_stat.st_mode)
+    if not is_directory or is_symlink:
+        return LeftoverInspection(
+            path,
+            True,
+            is_directory,
+            is_symlink,
+            1,
+            root_stat.st_size if stat.S_ISREG(root_stat.st_mode) else 0,
+            (path.name,),
+            False,
+            root_stat.st_dev,
+            root_stat.st_ino,
+        )
+
+    entry_count = 0
+    total_bytes = 0
+    sample: List[str] = []
+    truncated = False
+    stack: List[Path] = [path]
+    while stack and entry_count < LEFTOVER_ENTRY_LIMIT:
+        directory = stack.pop()
+        try:
+            entries = list(os.scandir(directory))
+        except OSError:
+            truncated = True
+            continue
+        for entry_index, entry in enumerate(entries):
+            try:
+                entry_stat = entry.stat(follow_symlinks=False)
+            except OSError:
+                truncated = True
+                continue
+            entry_path = Path(entry.path)
+            if stat.S_ISDIR(entry_stat.st_mode) and not stat.S_ISLNK(entry_stat.st_mode):
+                stack.append(entry_path)
+                continue
+            entry_count += 1
+            if stat.S_ISREG(entry_stat.st_mode):
+                total_bytes += entry_stat.st_size
+            if len(sample) < LEFTOVER_SAMPLE_LIMIT:
+                with contextlib.suppress(ValueError):
+                    sample.append(entry_path.relative_to(path).as_posix())
+            if entry_count >= LEFTOVER_ENTRY_LIMIT:
+                truncated = bool(stack) or entry_index < len(entries) - 1
+                break
+    return LeftoverInspection(
+        path,
+        True,
+        True,
+        False,
+        entry_count,
+        total_bytes,
+        tuple(sample),
+        truncated,
+        root_stat.st_dev,
+        root_stat.st_ino,
+    )
+
+
+def collect_worktree_inventory(
+    repo_root: Path,
+    state_dir: Path,
+    *,
+    worktree_root: Optional[Path] = None,
+) -> List[WorktreeInventoryItem]:
+    repo_root = _validate_cleanup_repository(_canonical(repo_root))
+    common_git_dir = _git_common_dir(repo_root)
+    listed = _run_git(repo_root, ["worktree", "list", "--porcelain", "-z"], text=False)
+    live_records: Dict[Path, Mapping[str, Any]] = {}
+    for record in parse_worktree_records(listed.stdout):
+        raw_path = record.get("worktree")
+        if isinstance(raw_path, str):
+            live_records[_absolute_path(Path(raw_path))] = record
+
+    mappings: Dict[Path, Mapping[str, Any]] = {}
+    for record in list_worktree_mappings(state_dir):
+        raw_target = record.get("target")
+        raw_common = record.get("common_git_dir")
+        raw_repo = record.get("repo_root")
+        if not isinstance(raw_target, str):
+            continue
+        belongs = False
+        if isinstance(raw_common, str):
+            belongs = _canonical(Path(raw_common)) == common_git_dir
+        elif isinstance(raw_repo, str):
+            belongs = _canonical(Path(raw_repo)) == repo_root
+        if belongs:
+            mappings[_absolute_path(Path(raw_target))] = record
+
+    discovered_paths: set[Path] = set()
+    if worktree_root is not None:
+        bucket = _canonical(worktree_root) / repo_root.name
+        try:
+            discovered_paths = {
+                _absolute_path(Path(entry.path))
+                for entry in os.scandir(bucket)
+            }
+        except OSError:
+            discovered_paths = set()
+
+    items: List[WorktreeInventoryItem] = []
+    for path in sorted(
+        set(live_records) | set(mappings) | discovered_paths,
+        key=lambda value: os.fspath(value).casefold(),
+    ):
+        live = live_records.get(path)
+        mapping = mappings.get(path, {})
+        registered = live is not None
+        raw_branch = live.get("branch") if live is not None else mapping.get("branch")
+        branch: Optional[str] = None
+        if isinstance(raw_branch, str) and raw_branch:
+            branch = raw_branch.removeprefix("refs/heads/")
+        raw_head = live.get("HEAD") if live is not None else None
+        head_oid = raw_head if isinstance(raw_head, str) and raw_head else None
+        leftover = inspect_leftover_path(path)
+        branch_exists = _ref_exists(repo_root, f"refs/heads/{branch}") if branch else None
+        if path == repo_root:
+            status_value = "primary"
+        elif registered and leftover.exists and leftover.is_directory and not leftover.is_symlink:
+            status_value = "active"
+        elif registered:
+            status_value = "missing"
+        elif leftover.exists:
+            status_value = "residue"
+        elif branch_exists:
+            status_value = "branch-only"
+        else:
+            status_value = "removed"
+        raw_created_oid = mapping.get("created_head_oid")
+        raw_candidates = mapping.get("base_candidates")
+        base_candidates = tuple(
+            candidate for candidate in raw_candidates if isinstance(candidate, str)
+        ) if isinstance(raw_candidates, list) else ()
+        workspace_id = mapping.get("workspace_id")
+        removed_at = mapping.get("removed_at")
+        items.append(
+            WorktreeInventoryItem(
+                repo_root=repo_root,
+                worktree_path=path,
+                branch=branch,
+                head_oid=head_oid,
+                created_head_oid=raw_created_oid if isinstance(raw_created_oid, str) else None,
+                base_candidates=base_candidates,
+                registered=registered,
+                path_exists=leftover.exists,
+                branch_exists=branch_exists,
+                status=status_value,
+                provenance_verified=registered or bool(mapping.get("provenance_verified")),
+                workspace_id=workspace_id if isinstance(workspace_id, str) else None,
+                forced_removal=bool(mapping.get("forced_removal")),
+                removed_at=removed_at if isinstance(removed_at, str) else None,
+                on_created_status=(
+                    mapping.get("on_created_status")
+                    if isinstance(mapping.get("on_created_status"), str)
+                    else None
+                ),
+                before_remove_status=(
+                    mapping.get("before_remove_status")
+                    if isinstance(mapping.get("before_remove_status"), str)
+                    else None
+                ),
+                after_remove_status=(
+                    mapping.get("after_remove_status")
+                    if isinstance(mapping.get("after_remove_status"), str)
+                    else None
+                ),
+                leftover=leftover,
+            )
+        )
+    return items
+
+
+def _format_byte_count(value: int) -> str:
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    amount = float(value)
+    for unit in units:
+        if amount < 1024 or unit == units[-1]:
+            return f"{int(amount)} {unit}" if unit == "B" else f"{amount:.1f} {unit}"
+        amount /= 1024
+    return f"{value} B"
+
+
+def inventory_lines(
+    repo_root: Path,
+    state_dir: Path,
+    *,
+    env: Optional[Mapping[str, str]] = None,
+    items: Optional[Sequence[WorktreeInventoryItem]] = None,
+) -> List[str]:
+    effective_env = {} if env is None else env
+    inventory = list(items) if items is not None else collect_worktree_inventory(
+        repo_root, state_dir, worktree_root=load_worktree_directory(effective_env)
+    )
+    lifecycle = load_lifecycle_commands(_canonical(repo_root))
+    lines = [
+        f"Repository: {_canonical(repo_root)}",
+        f"Worktrees: {len(inventory)}",
+        "Lifecycle: " + ", ".join(
+            f"{phase}={len(lifecycle[phase])}" for phase in LIFECYCLE_PHASES
+        ),
+    ]
+    for index, item in enumerate(inventory, 1):
+        branch = item.branch or "(detached/unknown)"
+        flags = [
+            f"git={'yes' if item.registered else 'no'}",
+            f"branch={('yes' if item.branch_exists else 'no') if item.branch_exists is not None else 'n/a'}",
+            f"path={'yes' if item.path_exists else 'no'}",
+            f"provenance={'verified' if item.provenance_verified else 'unverified'}",
+        ]
+        lines.append(f"{index}. [{item.status}] {branch}  {'  '.join(flags)}")
+        lines.append(f"   path: {item.worktree_path}")
+        created_oid = item.created_head_oid or item.head_oid
+        if created_oid:
+            detail = created_oid[:12]
+            if item.base_candidates:
+                detail += "  base candidates: " + ", ".join(item.base_candidates[:3])
+            lines.append(f"   created at: {detail}")
+        if item.status == "residue":
+            suffix = "+" if item.leftover.truncated else ""
+            lines.append(
+                f"   residue: {item.leftover.entry_count}{suffix} files, "
+                f"{_format_byte_count(item.leftover.total_bytes)}"
+            )
+            for sample in item.leftover.sample_paths[:3]:
+                lines.append(f"     - {sample}")
+        lifecycle_status = ", ".join(
+            f"{label}={value}"
+            for label, value in (
+                ("created", item.on_created_status),
+                ("before-remove", item.before_remove_status),
+                ("after-remove", item.after_remove_status),
+            )
+            if value
+        )
+        if lifecycle_status:
+            lines.append(f"   lifecycle: {lifecycle_status}")
+    return lines
+
+
+def remove_leftover_worktree_files(
+    repo_root: Path,
+    worktree_path: Path,
+    *,
+    worktree_root: Optional[Path],
+    provenance_verified: bool,
+    expected_device: Optional[int],
+    expected_inode: Optional[int],
+) -> None:
+    repo_root = _validate_cleanup_repository(_canonical(repo_root))
+    worktree_path = _absolute_path(worktree_path)
+    if worktree_root is None:
+        raise BootstrapError("refusing cleanup without an absolute configured worktree root")
+    configured_root = _canonical(worktree_root)
+    try:
+        relative = worktree_path.relative_to(configured_root)
+    except ValueError as exc:
+        raise BootstrapError("refusing to remove a path outside the configured worktree root") from exc
+    if not relative.parts:
+        raise BootstrapError("refusing to remove the configured worktree root itself")
+    if worktree_path == repo_root:
+        raise BootstrapError("refusing to remove the primary checkout")
+    if not provenance_verified:
+        raise BootstrapError("refusing to remove an unverified leftover directory")
+    listed = _run_git(repo_root, ["worktree", "list", "--porcelain", "-z"], text=False)
+    if worktree_path in {_absolute_path(path) for path in parse_worktree_porcelain(listed.stdout)}:
+        raise BootstrapError("refusing to remove a path still registered as a Git worktree")
+    inspection = inspect_leftover_path(worktree_path)
+    if not inspection.exists:
+        return
+    if not inspection.is_directory or inspection.is_symlink:
+        raise BootstrapError("refusing to remove a leftover path that is not a real directory")
+    if _canonical(worktree_path.parent) != worktree_path.parent:
+        raise BootstrapError("refusing to remove a leftover path through a changed parent link")
+    if (
+        expected_device is not None
+        and expected_inode is not None
+        and (inspection.device, inspection.inode) != (expected_device, expected_inode)
+    ):
+        raise BootstrapError("leftover directory changed after it was displayed; review it again")
+    repository_probe = _run_git(
+        worktree_path,
+        ["rev-parse", "--show-toplevel"],
+        check=False,
+    )
+    if repository_probe.returncode == 0:
+        raise BootstrapError("refusing to remove a path that Git still recognizes as a repository")
+    try:
+        shutil.rmtree(worktree_path)
+    except OSError as exc:
+        raise BootstrapError(f"could not remove leftover worktree files: {exc}") from exc
+    if os.path.lexists(worktree_path):
+        raise BootstrapError(
+            "leftover path was recreated during cleanup; stop processes writing to it and retry"
+        )
+
+
 def _pending_cleanup_dir(state_dir: Path) -> Path:
     return state_dir / BRANCH_CLEANUP_DIR / "pending"
 
 
 def pending_cleanup_id(repo_root: Path, worktree_path: Path, branch: str) -> str:
-    raw = f"{_canonical(repo_root)}\0{_canonical(worktree_path)}\0{branch}".encode(
+    raw = f"{_canonical(repo_root)}\0{_absolute_path(worktree_path)}\0{branch}".encode(
         "utf-8", "surrogateescape"
     )
     return hashlib.sha256(raw).hexdigest()[:24]
@@ -1206,7 +1760,7 @@ def _removed_event_details(env: Mapping[str, str]) -> Tuple[Path, Optional[Path]
         provenance = workspace.get("worktree")
         if isinstance(provenance, dict) and isinstance(provenance.get("repo_root"), str):
             repo_root = _canonical(Path(provenance["repo_root"]))
-    return _canonical(Path(raw_path)), repo_root, branch, bool(data.get("forced", False))
+    return _absolute_path(Path(raw_path)), repo_root, branch, bool(data.get("forced", False))
 
 
 def _validate_cleanup_repository(repo_root: Path, expected_common: Optional[str] = None) -> Path:
@@ -1230,8 +1784,24 @@ def queue_branch_cleanup(env: Mapping[str, str], state_dir: Path) -> Mapping[str
         worktree = data.get("worktree") if isinstance(data, dict) else None
         raw_path = worktree.get("path") if isinstance(worktree, dict) else None
         if isinstance(raw_path, str) and raw_path:
-            with contextlib.suppress(OSError):
-                worktree_map_path(state_dir, Path(raw_path)).unlink()
+            removed_path = _absolute_path(Path(raw_path))
+            mapping = load_worktree_mapping(state_dir, removed_path)
+            raw_repo = mapping.get("repo_root") if isinstance(mapping, dict) else None
+            workspace = data.get("workspace") if isinstance(data, dict) else None
+            provenance = workspace.get("worktree") if isinstance(workspace, dict) else None
+            if isinstance(provenance, dict) and isinstance(provenance.get("repo_root"), str):
+                raw_repo = provenance["repo_root"]
+            if isinstance(raw_repo, str):
+                with contextlib.suppress(BootstrapError):
+                    removed_repo = _validate_cleanup_repository(_canonical(Path(raw_repo)))
+                    mark_worktree_removed(
+                        state_dir,
+                        removed_path,
+                        removed_repo,
+                        common_git_dir=_git_common_dir(removed_repo),
+                        branch=None,
+                        forced=bool(data.get("forced", False)) if isinstance(data, dict) else False,
+                    )
         raise
     mapping = load_worktree_mapping(state_dir, worktree_path)
     cached_repo = mapping.get("repo_root") if isinstance(mapping, dict) else None
@@ -1249,8 +1819,17 @@ def queue_branch_cleanup(env: Mapping[str, str], state_dir: Path) -> Mapping[str
     if branch_check.returncode != 0:
         raise BootstrapError("removed worktree reported an invalid branch name")
     cleanup_id = pending_cleanup_id(repo_root, worktree_path, branch)
+    removed_record = mark_worktree_removed(
+        state_dir,
+        worktree_path,
+        repo_root,
+        common_git_dir=_git_common_dir(repo_root),
+        branch=branch,
+        forced=forced,
+    )
+    leftover = inspect_leftover_path(worktree_path)
     payload: Dict[str, Any] = {
-        "version": 1,
+        "version": 2,
         "id": cleanup_id,
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "repo_root": os.fspath(repo_root),
@@ -1258,10 +1837,11 @@ def queue_branch_cleanup(env: Mapping[str, str], state_dir: Path) -> Mapping[str
         "branch": branch,
         "forced_worktree_removal": forced,
         "status": "pending",
+        "common_git_dir": removed_record.get("common_git_dir"),
+        "provenance_verified": bool(removed_record.get("provenance_verified")),
+        "leftover_detected_at_queue": leftover.exists,
     }
     _atomic_write_json(pending_cleanup_path(state_dir, cleanup_id), payload)
-    with contextlib.suppress(OSError):
-        worktree_map_path(state_dir, worktree_path).unlink()
     return payload
 
 
@@ -1407,11 +1987,30 @@ def _record_cleanup_result(
         "id": record.get("id"),
         "repo_root": record.get("repo_root"),
         "branch": record.get("branch"),
+        "worktree_path": record.get("worktree_path"),
+        "branch_outcome": record.get("branch_outcome"),
+        "checkout_outcome": record.get("checkout_outcome"),
         "outcome": outcome,
     }
     if error:
         payload["error"] = error
     _atomic_write_json(state_dir / BRANCH_CLEANUP_DIR / "last-result.json", payload)
+
+
+def _update_pending_cleanup_record(
+    state_dir: Path,
+    record: Mapping[str, Any],
+    values: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    cleanup_id = record.get("id")
+    if not isinstance(cleanup_id, str):
+        raise BootstrapError("pending cleanup record has no valid id")
+    payload = {key: value for key, value in record.items() if key != "_path"}
+    payload.update(values)
+    _atomic_write_json(pending_cleanup_path(state_dir, cleanup_id), payload)
+    result = dict(payload)
+    result["_path"] = os.fspath(pending_cleanup_path(state_dir, cleanup_id))
+    return result
 
 
 def _resolve_pending_cleanup(
@@ -1643,6 +2242,7 @@ def _cleanup_status(inspection: BranchInspection) -> Tuple[str, str]:
 def _plain_cleanup_dialog(
     inspection: BranchInspection,
     record: Mapping[str, Any],
+    leftover: Optional[LeftoverInspection] = None,
 ) -> List[str]:
     lines = [
         "Herdr branch cleanup review",
@@ -1660,6 +2260,13 @@ def _plain_cleanup_dialog(
     lines.append("Remote branches are never deleted by this plugin.")
     if record.get("forced_worktree_removal"):
         lines.append("Warning: the worktree itself was removed with --force.")
+    if leftover is not None and leftover.exists:
+        suffix = "+" if leftover.truncated else ""
+        lines.append(
+            f"Leftover checkout files: {leftover.entry_count}{suffix}, "
+            f"{_format_byte_count(leftover.total_bytes)}"
+        )
+        lines.extend(f"  {path}" for path in leftover.sample_paths[:3])
     if inspection.protected:
         lines.append("Deletion blocked: this is a protected/default branch.")
     if inspection.used_by_worktrees:
@@ -1676,9 +2283,10 @@ def render_cleanup_dialog(
     columns: int,
     decorated: bool,
     color_enabled: bool,
+    leftover: Optional[LeftoverInspection] = None,
 ) -> List[str]:
     if not _supports_action_footer(decorated, columns):
-        return _plain_cleanup_dialog(inspection, record)
+        return _plain_cleanup_dialog(inspection, record, leftover)
 
     width = max(MIN_ACTION_FOOTER_COLUMNS, min(columns, 88))
     status, status_role = _cleanup_status(inspection)
@@ -1713,12 +2321,29 @@ def render_cleanup_dialog(
         if inspection.ahead is not None and inspection.behind is not None:
             upstream += f" · ahead {inspection.ahead}, behind {inspection.behind}"
         detail("Upstream", upstream)
+    if leftover is not None and leftover.exists:
+        suffix = "+" if leftover.truncated else ""
+        detail(
+            "Files remain",
+            f"{leftover.entry_count}{suffix} files · {_format_byte_count(leftover.total_bytes)}",
+            "warning",
+            True,
+        )
 
     lines.append("")
     if record.get("forced_worktree_removal"):
         lines.append(
             _flat_line(
                 [StyledSegment("! Worktree removal was forced.", "peach", bold=True)],
+                width,
+                palette,
+                color_enabled=color_enabled,
+            )
+        )
+    if leftover is not None and leftover.exists:
+        lines.append(
+            _flat_line(
+                [StyledSegment("! The removed checkout directory still contains files.", "warning", bold=True)],
                 width,
                 palette,
                 color_enabled=color_enabled,
@@ -1904,6 +2529,7 @@ def normalize_cleanup_choice(value: str) -> str:
         "ㄴ": "s",
         "ㅂ": "q",
         "ㅏ": "k",
+        "ㄱ": "r",
     }.get(choice, choice)
 
 
@@ -1933,10 +2559,16 @@ def review_pending_cleanups(
         output_fn("No pending branch cleanups.")
         return 0
 
-    for record in records:
+    for initial_record in records:
+        record: Mapping[str, Any] = initial_record
         repo_value = record.get("repo_root")
         branch_value = record.get("branch")
-        if not isinstance(repo_value, str) or not isinstance(branch_value, str):
+        worktree_value = record.get("worktree_path")
+        if (
+            not isinstance(repo_value, str)
+            or not isinstance(branch_value, str)
+            or not isinstance(worktree_value, str)
+        ):
             output_fn("Skipping an invalid pending branch cleanup record.")
             continue
         try:
@@ -1948,6 +2580,7 @@ def review_pending_cleanups(
             )
             output_fn("The request remains pending for later review.")
             continue
+        leftover = inspect_leftover_path(Path(worktree_value))
 
         def display_cleanup(*notices: str) -> None:
             _clear_screen()
@@ -1958,120 +2591,210 @@ def review_pending_cleanups(
                 columns=columns,
                 decorated=decorated,
                 color_enabled=color_enabled,
+                leftover=leftover,
             ):
                 output_fn(line)
             for notice in notices:
                 output_fn(notice)
 
-        display_cleanup()
-
-        if not inspection.exists:
-            output_fn("The local branch no longer exists; marking this request resolved.")
-            _resolve_pending_cleanup(state_dir, record, "already_absent")
-            continue
-
         action_footer_visible = _supports_action_footer(decorated, columns)
         single_key_mode = action_footer_visible and input_fn is input and sys.stdin.isatty()
-        while True:
-            if inspection.protected or inspection.used_by_worktrees:
-                prompt = "[K]eep branch (default)  [S]kip for later  [Q]uit: "
-            else:
-                prompt = "[K]eep (default)  [D]elete safely  [F]orce delete...  [S]kip  [Q]uit: "
-            if action_footer_visible and not single_key_mode:
-                prompt = _style_text(
-                    "Select › ",
-                    palette,
-                    "accent",
-                    enabled=color_enabled,
-                    bold=True,
+        branch_outcome = record.get("branch_outcome")
+        deferred = False
+        if not isinstance(branch_outcome, str):
+            display_cleanup()
+            if not inspection.exists:
+                branch_outcome = "already_absent"
+                record = _update_pending_cleanup_record(
+                    state_dir,
+                    record,
+                    {"branch_outcome": branch_outcome},
                 )
-            try:
-                if single_key_mode:
+                output_fn("The local branch no longer exists.")
+            else:
+                while True:
+                    if inspection.protected or inspection.used_by_worktrees:
+                        prompt = "[K]eep branch (default)  [S]kip for later  [Q]uit: "
+                    else:
+                        prompt = "[K]eep (default)  [D]elete safely  [F]orce delete...  [S]kip  [Q]uit: "
+                    if action_footer_visible and not single_key_mode:
+                        prompt = _style_text(
+                            "Select › ",
+                            palette,
+                            "accent",
+                            enabled=color_enabled,
+                            bold=True,
+                        )
                     try:
-                        choice = normalize_cleanup_choice(read_single_key())
-                    except (OSError, ValueError, AttributeError):
-                        single_key_mode = False
-                        choice = normalize_cleanup_choice(input_fn(prompt))
-                else:
-                    choice = normalize_cleanup_choice(input_fn(prompt))
+                        if single_key_mode:
+                            try:
+                                choice = normalize_cleanup_choice(read_single_key())
+                            except (OSError, ValueError, AttributeError):
+                                single_key_mode = False
+                                choice = normalize_cleanup_choice(input_fn(prompt))
+                        else:
+                            choice = normalize_cleanup_choice(input_fn(prompt))
+                    except EOFError:
+                        output_fn("No interactive input; request remains pending.")
+                        return 0
+                    if choice in ("", "k", "keep"):
+                        branch_outcome = "kept"
+                        record = _update_pending_cleanup_record(
+                            state_dir, record, {"branch_outcome": branch_outcome}
+                        )
+                        output_fn(f"Kept local branch {inspection.branch}.")
+                        break
+                    if choice in ("s", "skip"):
+                        output_fn("Request left pending for later review.")
+                        deferred = True
+                        break
+                    if choice in ("q", "quit"):
+                        return 0
+                    if (
+                        choice in ("d", "delete")
+                        and not inspection.protected
+                        and not inspection.used_by_worktrees
+                    ):
+                        try:
+                            delete_local_branch(
+                                inspection.repo_root,
+                                inspection.branch,
+                                force=False,
+                                expected_oid=inspection.head_oid,
+                            )
+                        except BootstrapError as exc:
+                            _record_cleanup_result(
+                                state_dir, record, "safe_delete_failed", error=str(exc)
+                            )
+                            inspection = inspect_branch(inspection.repo_root, inspection.branch)
+                            display_cleanup(
+                                f"Safe deletion refused: {_safe_terminal_text(exc)}",
+                                "The request remains pending. Use force only after reviewing unmerged commits.",
+                            )
+                            continue
+                        branch_outcome = "deleted_safely"
+                        record = _update_pending_cleanup_record(
+                            state_dir, record, {"branch_outcome": branch_outcome}
+                        )
+                        output_fn(f"Deleted local branch {inspection.branch} safely.")
+                        break
+                    if (
+                        choice in ("f", "force")
+                        and not inspection.protected
+                        and not inspection.used_by_worktrees
+                    ):
+                        _clear_screen()
+                        for line in render_force_delete_dialog(
+                            inspection,
+                            palette,
+                            columns=columns,
+                            decorated=decorated,
+                            color_enabled=color_enabled,
+                        ):
+                            output_fn(line)
+                        confirmation_prompt = f"Type '{inspection.branch}' to force-delete: "
+                        if decorated:
+                            confirmation_prompt = _style_text(
+                                "Branch name › ",
+                                palette,
+                                "danger",
+                                enabled=color_enabled,
+                                bold=True,
+                            )
+                        try:
+                            confirmation = input_fn(confirmation_prompt).strip()
+                        except EOFError:
+                            output_fn("No confirmation; request remains pending.")
+                            return 0
+                        if confirmation != inspection.branch:
+                            display_cleanup("Branch name did not match; nothing was deleted.")
+                            continue
+                        try:
+                            delete_local_branch(
+                                inspection.repo_root,
+                                inspection.branch,
+                                force=True,
+                                expected_oid=inspection.head_oid,
+                            )
+                        except BootstrapError as exc:
+                            _record_cleanup_result(
+                                state_dir, record, "force_delete_failed", error=str(exc)
+                            )
+                            inspection = inspect_branch(inspection.repo_root, inspection.branch)
+                            display_cleanup(f"Force deletion failed: {_safe_terminal_text(exc)}")
+                            continue
+                        branch_outcome = "deleted_forcibly"
+                        record = _update_pending_cleanup_record(
+                            state_dir, record, {"branch_outcome": branch_outcome}
+                        )
+                        output_fn(f"Force-deleted local branch {inspection.branch}.")
+                        break
+                    if single_key_mode:
+                        sys.stdout.write("\a")
+                        sys.stdout.flush()
+                    else:
+                        output_fn("Unknown or unavailable choice.")
+        if deferred:
+            continue
+
+        leftover = inspect_leftover_path(Path(worktree_value))
+        if not leftover.exists:
+            record = _update_pending_cleanup_record(
+                state_dir, record, {"checkout_outcome": "absent"}
+            )
+            _resolve_pending_cleanup(state_dir, record, str(branch_outcome))
+            continue
+
+        display_cleanup("Review the leftover checkout directory separately from the branch.")
+        while True:
+            prompt = "[K]eep files (default)  [R]emove files...  [S]kip  [Q]uit: "
+            try:
+                choice = normalize_cleanup_choice(input_fn(prompt))
             except EOFError:
                 output_fn("No interactive input; request remains pending.")
                 return 0
             if choice in ("", "k", "keep"):
-                _resolve_pending_cleanup(state_dir, record, "kept")
-                output_fn(f"Kept local branch {inspection.branch}.")
+                record = _update_pending_cleanup_record(
+                    state_dir, record, {"checkout_outcome": "kept"}
+                )
+                _resolve_pending_cleanup(state_dir, record, "kept_with_leftover_files")
+                output_fn(f"Kept leftover files at {worktree_value}.")
                 break
             if choice in ("s", "skip"):
-                output_fn("Request left pending for later review.")
+                output_fn("Leftover files remain pending for later review.")
                 break
             if choice in ("q", "quit"):
                 return 0
-            if choice in ("d", "delete") and not inspection.protected and not inspection.used_by_worktrees:
+            if choice in ("r", "remove"):
+                confirmation = input_fn(
+                    f"Type '{Path(worktree_value).name}' to remove the leftover directory: "
+                ).strip()
+                if confirmation != Path(worktree_value).name:
+                    output_fn("Directory name did not match; nothing was removed.")
+                    continue
                 try:
-                    delete_local_branch(
-                        inspection.repo_root,
-                        inspection.branch,
-                        force=False,
-                        expected_oid=inspection.head_oid,
+                    remove_leftover_worktree_files(
+                        Path(repo_value),
+                        Path(worktree_value),
+                        worktree_root=load_worktree_directory(effective_env),
+                        provenance_verified=bool(record.get("provenance_verified")),
+                        expected_device=leftover.device,
+                        expected_inode=leftover.inode,
                     )
                 except BootstrapError as exc:
-                    _record_cleanup_result(state_dir, record, "safe_delete_failed", error=str(exc))
-                    inspection = inspect_branch(inspection.repo_root, inspection.branch)
-                    display_cleanup(
-                        f"Safe deletion refused: {_safe_terminal_text(exc)}",
-                        "The request remains pending. Use force only after reviewing unmerged commits.",
+                    _record_cleanup_result(
+                        state_dir, record, "checkout_delete_failed", error=str(exc)
                     )
+                    output_fn(f"Leftover deletion failed: {_safe_terminal_text(exc)}")
+                    leftover = inspect_leftover_path(Path(worktree_value))
                     continue
-                _resolve_pending_cleanup(state_dir, record, "deleted_safely")
-                output_fn(f"Deleted local branch {inspection.branch} safely.")
+                record = _update_pending_cleanup_record(
+                    state_dir, record, {"checkout_outcome": "removed"}
+                )
+                _resolve_pending_cleanup(state_dir, record, str(branch_outcome))
+                output_fn(f"Removed leftover files at {worktree_value}.")
                 break
-            if choice in ("f", "force") and not inspection.protected and not inspection.used_by_worktrees:
-                _clear_screen()
-                for line in render_force_delete_dialog(
-                    inspection,
-                    palette,
-                    columns=columns,
-                    decorated=decorated,
-                    color_enabled=color_enabled,
-                ):
-                    output_fn(line)
-                confirmation_prompt = f"Type '{inspection.branch}' to force-delete: "
-                if decorated:
-                    confirmation_prompt = _style_text(
-                        "Branch name › ",
-                        palette,
-                        "danger",
-                        enabled=color_enabled,
-                        bold=True,
-                    )
-                try:
-                    confirmation = input_fn(confirmation_prompt).strip()
-                except EOFError:
-                    output_fn("No confirmation; request remains pending.")
-                    return 0
-                if confirmation != inspection.branch:
-                    display_cleanup("Branch name did not match; nothing was deleted.")
-                    continue
-                try:
-                    delete_local_branch(
-                        inspection.repo_root,
-                        inspection.branch,
-                        force=True,
-                        expected_oid=inspection.head_oid,
-                    )
-                except BootstrapError as exc:
-                    _record_cleanup_result(state_dir, record, "force_delete_failed", error=str(exc))
-                    inspection = inspect_branch(inspection.repo_root, inspection.branch)
-                    display_cleanup(f"Force deletion failed: {_safe_terminal_text(exc)}")
-                    continue
-                _resolve_pending_cleanup(state_dir, record, "deleted_forcibly")
-                output_fn(f"Force-deleted local branch {inspection.branch}.")
-                break
-            if single_key_mode:
-                sys.stdout.write("\a")
-                sys.stdout.flush()
-            else:
-                output_fn("Unknown or unavailable choice.")
+            output_fn("Unknown choice.")
     return 0
 
 
@@ -2136,6 +2859,7 @@ def launch_management_popup(
     sizes = {
         "manage": MANAGE_POPUP_SIZE,
         "setup-manage": SETUP_MANAGE_POPUP_SIZE,
+        "inventory": INVENTORY_POPUP_SIZE,
     }
     if entrypoint not in sizes:
         raise BootstrapError(f"unknown management entrypoint: {entrypoint}")
@@ -2241,13 +2965,143 @@ def launch_branch_cleanup_popup(
     return False
 
 
+def _lifecycle_environment(
+    *,
+    worktree_path: Path,
+    repo_root: Path,
+    branch: Optional[str],
+    head_oid: Optional[str],
+    forced: bool,
+    leftover: bool,
+) -> Mapping[str, str]:
+    return {
+        "HERDR_WORKTREE_PATH": os.fspath(worktree_path),
+        "HERDR_PRIMARY_PATH": os.fspath(repo_root),
+        "HERDR_WORKTREE_BRANCH": branch or "",
+        "HERDR_WORKTREE_HEAD": head_oid or "",
+        "HERDR_REMOVAL_FORCED": "1" if forced else "0",
+        "HERDR_LEFTOVER_DETECTED": "1" if leftover else "0",
+    }
+
+
+def _update_worktree_mapping(
+    state_dir: Path,
+    worktree_path: Path,
+    values: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    existing = load_worktree_mapping(state_dir, worktree_path)
+    payload: Dict[str, Any] = dict(existing) if isinstance(existing, dict) else {
+        "version": 2,
+        "target": os.fspath(_absolute_path(worktree_path)),
+    }
+    payload.update(values)
+    _atomic_write_json(worktree_map_path(state_dir, worktree_path), payload)
+    return payload
+
+
+def _removed_lifecycle_context(
+    env: Mapping[str, str],
+    state_dir: Path,
+) -> Tuple[Path, Path, Optional[str], bool, Mapping[str, Any]]:
+    envelope = _decode_json_env(env, "HERDR_PLUGIN_EVENT_JSON")
+    data = envelope.get("data") if isinstance(envelope, dict) else None
+    worktree = data.get("worktree") if isinstance(data, dict) else None
+    raw_path = worktree.get("path") if isinstance(worktree, dict) else None
+    if not isinstance(raw_path, str) or not raw_path:
+        raise BootstrapError("worktree.removed event has no worktree path")
+    path = _absolute_path(Path(raw_path))
+    mapping = load_worktree_mapping(state_dir, path) or {}
+    raw_repo: Any = mapping.get("repo_root")
+    workspace = data.get("workspace") if isinstance(data, dict) else None
+    provenance = workspace.get("worktree") if isinstance(workspace, dict) else None
+    if isinstance(provenance, dict) and isinstance(provenance.get("repo_root"), str):
+        raw_repo = provenance["repo_root"]
+    if not isinstance(raw_repo, str):
+        raise BootstrapError("cannot identify the primary checkout for removed worktree")
+    repo_root = _validate_cleanup_repository(_canonical(Path(raw_repo)))
+    raw_branch = worktree.get("branch") if isinstance(worktree, dict) else None
+    branch = _normalize_local_branch(raw_branch) if isinstance(raw_branch, str) else None
+    forced = bool(data.get("forced", False)) if isinstance(data, dict) else False
+    return path, repo_root, branch, forced, mapping
+
+
+def run_after_remove_lifecycle(
+    env: Mapping[str, str],
+    state_dir: Path,
+) -> int:
+    path, repo_root, branch, forced, mapping = _removed_lifecycle_context(env, state_dir)
+    generation = mapping.get("recorded_at")
+    if generation and mapping.get("after_remove_generation") == generation:
+        return int(mapping.get("after_remove_completed_count", 0) or 0)
+    commands = load_lifecycle_commands(repo_root)["after_remove"]
+    leftover = inspect_leftover_path(path)
+    started_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    _update_worktree_mapping(
+        state_dir,
+        path,
+        {
+            "after_remove_status": "running",
+            "after_remove_started_at": started_at,
+            "after_remove_generation": generation,
+        },
+    )
+    try:
+        count = run_lifecycle_commands(
+            repo_root,
+            commands,
+            phase="after_remove",
+            environment=_lifecycle_environment(
+                worktree_path=path,
+                repo_root=repo_root,
+                branch=branch,
+                head_oid=mapping.get("created_head_oid") if isinstance(mapping.get("created_head_oid"), str) else None,
+                forced=forced,
+                leftover=leftover.exists,
+            ),
+        )
+    except BootstrapError as exc:
+        _update_worktree_mapping(
+            state_dir,
+            path,
+            {
+                "after_remove_status": "failed",
+                "after_remove_error": str(exc),
+                "after_remove_finished_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "after_remove_generation": generation,
+            },
+        )
+        raise
+    _update_worktree_mapping(
+        state_dir,
+        path,
+        {
+            "after_remove_status": "success",
+            "after_remove_completed_count": count,
+            "after_remove_finished_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "after_remove_generation": generation,
+        },
+    )
+    return count
+
+
 def handle_branch_cleanup_event(
     env: Mapping[str, str],
     state_dir: Path,
     *,
     open_popup: bool = True,
 ) -> Mapping[str, Any]:
-    pending = queue_branch_cleanup(env, state_dir)
+    try:
+        pending = queue_branch_cleanup(env, state_dir)
+    except NothingToDo:
+        try:
+            run_after_remove_lifecycle(env, state_dir)
+        except BootstrapError as exc:
+            print(f"after-remove lifecycle failed: {exc}", file=sys.stderr, flush=True)
+        raise
+    try:
+        run_after_remove_lifecycle(env, state_dir)
+    except BootstrapError as exc:
+        print(f"after-remove lifecycle failed: {exc}", file=sys.stderr, flush=True)
     popup_opened = False
     if open_popup:
         popup_opened = launch_branch_cleanup_popup(str(pending["id"]), str(pending["branch"]), env)
@@ -2264,6 +3118,33 @@ def handle_branch_cleanup_event(
 def target_key(context: RepositoryContext) -> str:
     value = f"{context.common_git_dir}\0{context.target}".encode("utf-8", "surrogateescape")
     return hashlib.sha256(value).hexdigest()[:24]
+
+
+def _active_lifecycle_environment(
+    context: RepositoryContext,
+    state_dir: Path,
+) -> Mapping[str, str]:
+    mapping = load_worktree_mapping(state_dir, context.target) or {}
+    branch_result = _run_git(
+        context.target,
+        ["symbolic-ref", "--quiet", "--short", "HEAD"],
+        check=False,
+    )
+    head_result = _run_git(context.target, ["rev-parse", "--verify", "HEAD"], check=False)
+    branch = branch_result.stdout.strip() if branch_result.returncode == 0 else None
+    head_oid = head_result.stdout.strip() if head_result.returncode == 0 else None
+    if not branch and isinstance(mapping.get("branch"), str):
+        branch = str(mapping["branch"])
+    if not head_oid and isinstance(mapping.get("created_head_oid"), str):
+        head_oid = str(mapping["created_head_oid"])
+    return _lifecycle_environment(
+        worktree_path=context.target,
+        repo_root=context.source,
+        branch=branch,
+        head_oid=head_oid,
+        forced=False,
+        leftover=False,
+    )
 
 
 class TargetLock:
@@ -2364,10 +3245,25 @@ def execute_action(action: str, context: RepositoryContext, state_dir: Path) -> 
                 print(f"copied {result['copied_count']} item(s)", flush=True)
             if action in ("bootstrap", "setup"):
                 commands = load_setup_commands(context.source)
-                result["setup_completed_count"] = run_setup_commands(context.target, commands)
+                result["setup_completed_count"] = run_lifecycle_commands(
+                    context.target,
+                    commands,
+                    phase="on_created",
+                    environment=_active_lifecycle_environment(context, state_dir),
+                )
                 print(f"completed {result['setup_completed_count']} setup command(s)", flush=True)
             result["status"] = "success"
             write_run_state(state_dir, context, result)
+            if action == "bootstrap" and load_worktree_mapping(state_dir, context.target) is not None:
+                _update_worktree_mapping(
+                    state_dir,
+                    context.target,
+                    {
+                        "on_created_status": "success",
+                        "on_created_completed_count": result["setup_completed_count"],
+                        "on_created_finished_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    },
+                )
             return result
         except BaseException as exc:
             if not isinstance(exc, KeyboardInterrupt):
@@ -2383,6 +3279,17 @@ def execute_action(action: str, context: RepositoryContext, state_dir: Path) -> 
                         result["exit_code"] = exc.command_exit_code
                 with contextlib.suppress(OSError):
                     write_run_state(state_dir, context, result)
+                if action == "bootstrap" and load_worktree_mapping(state_dir, context.target) is not None:
+                    with contextlib.suppress(OSError):
+                        _update_worktree_mapping(
+                            state_dir,
+                            context.target,
+                            {
+                                "on_created_status": "failed",
+                                "on_created_error": str(exc),
+                                "on_created_finished_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                            },
+                        )
             raise
 
 
@@ -2415,7 +3322,8 @@ def status_lines(context: RepositoryContext, state_dir: Path) -> Tuple[List[str]
             )
 
     try:
-        commands = load_setup_commands(context.source)
+        lifecycle = load_lifecycle_commands(context.source)
+        commands = lifecycle["on_created"]
     except BootstrapError as exc:
         lines.append(f"Setup: INVALID ({exc})")
         invalid = True
@@ -2426,6 +3334,11 @@ def status_lines(context: RepositoryContext, state_dir: Path) -> Tuple[List[str]
             lines.append(f"Setup: valid, {len(commands)} command(s)")
             for command in commands:
                 lines.append(f"  {command.name}: {list(command.argv)!r}, timeout={command.timeout_seconds}s")
+            lines.append(
+                "Lifecycle: "
+                f"before_remove={len(lifecycle['before_remove'])}, "
+                f"after_remove={len(lifecycle['after_remove'])}"
+            )
 
     last = read_run_state(state_dir, context)
     if last is None:
@@ -2519,31 +3432,62 @@ def write_setup_commands(
     context: RepositoryContext,
     commands: Sequence[SetupCommand],
 ) -> None:
-    normalized = _normalize_setup_commands(commands)
+    lifecycle = load_lifecycle_commands(context.source)
+    updated = {phase: list(lifecycle[phase]) for phase in LIFECYCLE_PHASES}
+    updated["on_created"] = _normalize_setup_commands(commands)
+    write_lifecycle_commands(context, updated)
+
+
+def write_lifecycle_commands(
+    context: RepositoryContext,
+    hooks: Mapping[str, Sequence[SetupCommand]],
+) -> None:
+    unknown = set(hooks) - set(LIFECYCLE_PHASES)
+    if unknown:
+        raise BootstrapError(f"unknown lifecycle phase: {sorted(unknown)[0]}")
+    normalized = {
+        phase: _normalize_setup_commands(hooks.get(phase, []))
+        for phase in LIFECYCLE_PHASES
+    }
     ensure_control_excluded(context, SETUP_FILE)
     _atomic_write_json(
         context.source / SETUP_FILE,
         {
-            "version": 1,
-            "commands": [
-                {
-                    "name": command.name,
-                    "argv": list(command.argv),
-                    "timeout_seconds": command.timeout_seconds,
-                }
-                for command in normalized
-            ],
+            "version": 2,
+            "hooks": {
+                phase: [
+                    {
+                        "name": command.name,
+                        "argv": list(command.argv),
+                        "timeout_seconds": command.timeout_seconds,
+                    }
+                    for command in normalized[phase]
+                ]
+                for phase in LIFECYCLE_PHASES
+            },
         },
     )
 
 
 def remove_setup_configuration(context: RepositoryContext) -> None:
+    lifecycle = load_lifecycle_commands(context.source)
+    if lifecycle["before_remove"] or lifecycle["after_remove"]:
+        updated = {phase: list(lifecycle[phase]) for phase in LIFECYCLE_PHASES}
+        updated["on_created"] = []
+        write_lifecycle_commands(context, updated)
+        return
     with contextlib.suppress(FileNotFoundError):
         (context.source / SETUP_FILE).unlink()
 
 
-def _prompt_default(prompt: str, default: str) -> str:
-    value = input(f"{prompt} [{default}]: ").strip()
+def _prompt_default(
+    prompt: str,
+    default: str,
+    *,
+    input_fn: Optional[Callable[[str], str]] = None,
+) -> str:
+    reader = input if input_fn is None else input_fn
+    value = reader(f"{prompt} [{default}]: ").strip()
     return default if not value else value
 
 
@@ -2557,13 +3501,19 @@ def _parse_setup_argv(value: str) -> Tuple[str, ...]:
     return argv
 
 
-def _prompt_setup_command(existing: Optional[SetupCommand] = None) -> SetupCommand:
+def _prompt_setup_command(
+    existing: Optional[SetupCommand] = None,
+    *,
+    input_fn: Optional[Callable[[str], str]] = None,
+) -> SetupCommand:
     name_default = existing.name if existing else "Install dependencies"
     argv_default = shlex.join(existing.argv) if existing else "npm ci"
     timeout_default = str(existing.timeout_seconds) if existing else "900"
-    name = _prompt_default("Name", name_default)
-    argv = _parse_setup_argv(_prompt_default("Command argv (quotes supported)", argv_default))
-    timeout_value = _prompt_default("Timeout seconds", timeout_default)
+    name = _prompt_default("Name", name_default, input_fn=input_fn)
+    argv = _parse_setup_argv(
+        _prompt_default("Command argv (quotes supported)", argv_default, input_fn=input_fn)
+    )
+    timeout_value = _prompt_default("Timeout seconds", timeout_default, input_fn=input_fn)
     try:
         timeout = int(timeout_value)
     except ValueError as exc:
@@ -3886,6 +4836,432 @@ def manage(
         notice = ("Unknown key. Choose one of the actions below.", "warning")
 
 
+def _find_workspace_id_for_path(value: Any, target: Path) -> Optional[str]:
+    if isinstance(value, list):
+        for item in value:
+            found = _find_workspace_id_for_path(item, target)
+            if found:
+                return found
+        return None
+    if not isinstance(value, dict):
+        return None
+    raw_worktree = value.get("worktree")
+    candidates: List[Any] = [value.get("cwd"), value.get("path")]
+    if isinstance(raw_worktree, dict):
+        candidates.extend(
+            [
+                raw_worktree.get("checkout_path"),
+                raw_worktree.get("path"),
+            ]
+        )
+    if any(
+        isinstance(candidate, str) and _absolute_path(Path(candidate)) == target
+        for candidate in candidates
+    ):
+        workspace_id = value.get("workspace_id") or value.get("id")
+        if isinstance(workspace_id, str) and workspace_id:
+            return workspace_id
+    for nested in value.values():
+        found = _find_workspace_id_for_path(nested, target)
+        if found:
+            return found
+    return None
+
+
+def query_herdr_workspace_id(
+    target: Path,
+    env: Mapping[str, str],
+    *,
+    fallback: Optional[str] = None,
+) -> Optional[str]:
+    herdr = _herdr_command(env)
+    if not herdr:
+        return fallback
+    try:
+        result = subprocess.run(
+            [herdr, "workspace", "list"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return fallback
+    if result.returncode != 0:
+        return fallback
+    try:
+        document = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return fallback
+    return _find_workspace_id_for_path(document, _absolute_path(target)) or fallback
+
+
+def _worktree_dirty_count(path: Path) -> int:
+    result = _run_git(
+        path,
+        ["status", "--porcelain", "-z", "--untracked-files=all"],
+        check=False,
+        text=False,
+    )
+    if result.returncode != 0:
+        raise BootstrapError("could not inspect worktree changes before removal")
+    return len([entry for entry in result.stdout.split(b"\0") if entry])
+
+
+def remove_managed_worktree(
+    item: WorktreeInventoryItem,
+    state_dir: Path,
+    env: Mapping[str, str],
+    *,
+    force: bool = False,
+) -> Mapping[str, Any]:
+    if item.status != "active" or not item.registered:
+        raise BootstrapError("only an active registered worktree can be removed")
+    if item.worktree_path == item.repo_root:
+        raise BootstrapError("the primary checkout cannot be removed")
+    if not item.provenance_verified:
+        raise BootstrapError("refusing to remove a worktree without recorded provenance")
+    dirty_count = _worktree_dirty_count(item.worktree_path)
+    if dirty_count and not force:
+        raise BootstrapError(
+            f"worktree has {dirty_count} modified or untracked entries; force confirmation is required"
+        )
+    workspace_id = query_herdr_workspace_id(
+        item.worktree_path,
+        env,
+        fallback=item.workspace_id,
+    )
+    if not workspace_id:
+        raise BootstrapError("cannot identify the active Herdr workspace for this worktree")
+    commands = load_lifecycle_commands(item.repo_root)["before_remove"]
+    operation_id = uuid.uuid4().hex
+    started_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    if load_worktree_mapping(state_dir, item.worktree_path) is None:
+        _atomic_write_json(
+            worktree_map_path(state_dir, item.worktree_path),
+            {
+                "version": 2,
+                "target": os.fspath(item.worktree_path),
+                "repo_root": os.fspath(item.repo_root),
+                "common_git_dir": os.fspath(_git_common_dir(item.repo_root)),
+                "branch": item.branch,
+                "created_head_oid": item.head_oid,
+                "base_candidates": list(item.base_candidates),
+                "workspace_id": item.workspace_id,
+                "recorded_at": started_at,
+                "status": "active",
+                "provenance_verified": True,
+            },
+        )
+    _update_worktree_mapping(
+        state_dir,
+        item.worktree_path,
+        {
+            "removal_operation_id": operation_id,
+            "removal_operation_status": "running",
+            "removal_requested_at": started_at,
+            "removal_requested_force": force,
+            "before_remove_status": "running",
+        },
+    )
+    try:
+        completed_count = run_lifecycle_commands(
+            item.worktree_path,
+            commands,
+            phase="before_remove",
+            environment=_lifecycle_environment(
+                worktree_path=item.worktree_path,
+                repo_root=item.repo_root,
+                branch=item.branch,
+                head_oid=item.head_oid or item.created_head_oid,
+                forced=force,
+                leftover=False,
+            ),
+        )
+    except BootstrapError as exc:
+        _update_worktree_mapping(
+            state_dir,
+            item.worktree_path,
+            {
+                "removal_operation_status": "blocked",
+                "before_remove_status": "failed",
+                "before_remove_error": str(exc),
+                "before_remove_finished_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            },
+        )
+        raise BootstrapError(f"before-remove lifecycle blocked removal: {exc}") from exc
+    _update_worktree_mapping(
+        state_dir,
+        item.worktree_path,
+        {
+            "before_remove_status": "success",
+            "before_remove_completed_count": completed_count,
+            "before_remove_finished_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        },
+    )
+    final_dirty_count = _worktree_dirty_count(item.worktree_path)
+    if final_dirty_count and not force:
+        message = (
+            f"worktree has {final_dirty_count} modified or untracked entries after "
+            "before-remove lifecycle; review and retry with force confirmation"
+        )
+        _update_worktree_mapping(
+            state_dir,
+            item.worktree_path,
+            {
+                "removal_operation_status": "blocked",
+                "removal_error": message,
+            },
+        )
+        raise BootstrapError(message)
+    herdr = _herdr_command(env)
+    if not herdr:
+        _update_worktree_mapping(
+            state_dir,
+            item.worktree_path,
+            {
+                "removal_operation_status": "failed",
+                "removal_error": "herdr is required for managed worktree removal",
+            },
+        )
+        raise BootstrapError("herdr is required for managed worktree removal")
+    command = [herdr, "worktree", "remove", "--workspace", workspace_id]
+    if force:
+        command.append("--force")
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _update_worktree_mapping(
+            state_dir,
+            item.worktree_path,
+            {"removal_operation_status": "failed", "removal_error": str(exc)},
+        )
+        raise BootstrapError("Herdr worktree removal did not complete") from exc
+    if result.returncode != 0:
+        error = result.stderr.strip() or result.stdout.strip() or "Herdr refused worktree removal"
+        _update_worktree_mapping(
+            state_dir,
+            item.worktree_path,
+            {"removal_operation_status": "failed", "removal_error": error},
+        )
+        raise BootstrapError(error)
+    return _update_worktree_mapping(
+        state_dir,
+        item.worktree_path,
+        {"removal_operation_status": "requested"},
+    )
+
+
+def _lifecycle_phase_title(phase: str) -> str:
+    return {
+        "on_created": "After worktree creation",
+        "before_remove": "Before managed removal",
+        "after_remove": "After worktree removal",
+    }[phase]
+
+
+def manage_lifecycle_configuration(
+    context: RepositoryContext,
+    state_dir: Path,
+    *,
+    input_fn: Callable[[str], str] = input,
+    output_fn: Callable[[str], None] = print,
+) -> int:
+    del state_dir
+    while True:
+        hooks = {phase: list(commands) for phase, commands in load_lifecycle_commands(context.source).items()}
+        output_fn("Worktree lifecycle commands")
+        for index, phase in enumerate(LIFECYCLE_PHASES, 1):
+            output_fn(f"  {index}. {_lifecycle_phase_title(phase)}: {len(hooks[phase])} command(s)")
+        choice = input_fn("Phase [1-3], or Q to return: ").strip().casefold()
+        if choice in ("q", "quit", "escape"):
+            return 0
+        try:
+            phase = LIFECYCLE_PHASES[int(choice) - 1]
+        except (ValueError, IndexError):
+            output_fn("Invalid lifecycle phase.")
+            continue
+        while True:
+            commands = hooks[phase]
+            output_fn(_lifecycle_phase_title(phase))
+            for index, command in enumerate(commands, 1):
+                output_fn(
+                    f"  {index}. {command.name}: {shlex.join(command.argv)} "
+                    f"({command.timeout_seconds}s)"
+                )
+            action = input_fn("[N]ew  [E]dit  [X]delete  [U]p  [M]down  [Q]back: ").strip().casefold()
+            if action in ("q", "quit", "escape"):
+                break
+            if action in ("n", "new"):
+                command = _prompt_setup_command(input_fn=input_fn)
+                hooks[phase] = [*commands, command]
+            elif action in ("e", "edit", "x", "delete", "u", "up", "m", "down"):
+                raw_index = input_fn("Command number: ").strip()
+                try:
+                    index = int(raw_index) - 1
+                    if index < 0 or index >= len(commands):
+                        raise ValueError
+                except ValueError:
+                    output_fn("Invalid command number.")
+                    continue
+                if action in ("e", "edit"):
+                    updated_command = _prompt_setup_command(commands[index], input_fn=input_fn)
+                    hooks[phase] = commands[:index] + [updated_command] + commands[index + 1:]
+                elif action in ("x", "delete"):
+                    hooks[phase] = commands[:index] + commands[index + 1:]
+                else:
+                    destination = index - 1 if action in ("u", "up") else index + 1
+                    if destination < 0 or destination >= len(commands):
+                        output_fn("Command is already at that edge.")
+                        continue
+                    updated_commands = commands[:]
+                    updated_commands[index], updated_commands[destination] = (
+                        updated_commands[destination],
+                        updated_commands[index],
+                    )
+                    hooks[phase] = updated_commands
+            else:
+                output_fn("Unknown action.")
+                continue
+            write_lifecycle_commands(context, hooks)
+            output_fn("Lifecycle configuration saved.")
+
+
+def _choose_inventory_item(
+    candidates: Sequence[WorktreeInventoryItem],
+    input_fn: Callable[[str], str],
+    output_fn: Callable[[str], None],
+) -> Optional[WorktreeInventoryItem]:
+    if not candidates:
+        return None
+    for index, item in enumerate(candidates, 1):
+        output_fn(f"  {index}. [{item.status}] {item.branch or '(detached/unknown)'}")
+        output_fn(f"     {item.worktree_path}")
+    raw = input_fn("Worktree number: ").strip()
+    try:
+        index = int(raw) - 1
+    except ValueError:
+        return None
+    return candidates[index] if 0 <= index < len(candidates) else None
+
+
+def manage_worktree_inventory(
+    context: RepositoryContext,
+    state_dir: Path,
+    *,
+    env: Optional[Mapping[str, str]] = None,
+    input_fn: Callable[[str], str] = input,
+    output_fn: Callable[[str], None] = print,
+) -> int:
+    effective_env = os.environ if env is None else env
+    while True:
+        if output_fn is print:
+            _clear_screen()
+        worktree_root = load_worktree_directory(effective_env)
+        items = collect_worktree_inventory(
+            context.source,
+            state_dir,
+            worktree_root=worktree_root,
+        )
+        for line in inventory_lines(
+            context.source,
+            state_dir,
+            env=effective_env,
+            items=items,
+        ):
+            output_fn(line)
+        output_fn("")
+        choice = input_fn(
+            "[R]escan  [L]ifecycle  [D]elete worktree  [C]lean residue  [B]ranches  [Q]uit: "
+        ).strip().casefold()
+        if choice in ("q", "quit", "escape"):
+            return 0
+        if choice in ("", "r", "rescan"):
+            continue
+        if choice in ("l", "lifecycle"):
+            manage_lifecycle_configuration(context, state_dir, input_fn=input_fn, output_fn=output_fn)
+            continue
+        if choice in ("b", "branches"):
+            review_pending_cleanups(
+                state_dir,
+                input_fn=input_fn,
+                output_fn=output_fn,
+                env=effective_env,
+            )
+            continue
+        if choice in ("d", "delete"):
+            candidates = [item for item in items if item.status == "active" and item.worktree_path != item.repo_root]
+            selected = _choose_inventory_item(candidates, input_fn, output_fn)
+            if selected is None:
+                output_fn("No valid active worktree was selected.")
+                continue
+            dirty_count = _worktree_dirty_count(selected.worktree_path)
+            token = selected.branch or selected.worktree_path.name
+            if dirty_count:
+                output_fn(f"Warning: {dirty_count} modified or untracked entries require forced removal.")
+            confirmation = input_fn(f"Type '{token}' to remove this worktree: ").strip()
+            if confirmation != token:
+                output_fn("Confirmation did not match; nothing was removed.")
+                continue
+            try:
+                remove_managed_worktree(
+                    selected,
+                    state_dir,
+                    effective_env,
+                    force=dirty_count > 0,
+                )
+                output_fn("Herdr worktree removal requested.")
+            except BootstrapError as exc:
+                output_fn(f"Removal failed: {exc}")
+            continue
+        if choice in ("c", "clean"):
+            candidates = [
+                item
+                for item in items
+                if item.status == "residue" and item.provenance_verified
+            ]
+            selected = _choose_inventory_item(candidates, input_fn, output_fn)
+            if selected is None:
+                output_fn("No valid leftover directory was selected.")
+                continue
+            confirmation = input_fn(
+                f"Type '{selected.worktree_path.name}' to remove leftover files: "
+            ).strip()
+            if confirmation != selected.worktree_path.name:
+                output_fn("Confirmation did not match; nothing was removed.")
+                continue
+            try:
+                remove_leftover_worktree_files(
+                    selected.repo_root,
+                    selected.worktree_path,
+                    worktree_root=worktree_root,
+                    provenance_verified=selected.provenance_verified,
+                    expected_device=selected.leftover.device,
+                    expected_inode=selected.leftover.inode,
+                )
+                _update_worktree_mapping(
+                    state_dir,
+                    selected.worktree_path,
+                    {
+                        "checkout_cleanup_status": "removed",
+                        "checkout_cleanup_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    },
+                )
+                output_fn("Leftover worktree files removed.")
+            except BootstrapError as exc:
+                output_fn(f"Cleanup failed: {exc}")
+            continue
+        output_fn("Unknown inventory action.")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Bootstrap Herdr Git worktrees")
     parser.add_argument(
@@ -3899,6 +5275,8 @@ def build_parser() -> argparse.ArgumentParser:
             "manage",
             "setup-manage-launch",
             "setup-manage",
+            "inventory-launch",
+            "inventory",
             "branch-cleanup-event",
             "branch-cleanup",
         ),
@@ -3924,6 +5302,8 @@ def main(argv: Optional[Sequence[str]] = None, env: Optional[Mapping[str, str]] 
             return launch_management_ui("manage", target_path, effective_env)
         if args.action == "setup-manage-launch":
             return launch_management_ui("setup-manage", target_path, effective_env)
+        if args.action == "inventory-launch":
+            return launch_management_ui("inventory", target_path, effective_env)
         context = resolve_repository(target_path)
         if args.action == "status":
             lines, invalid = status_lines(context, state_dir)
@@ -3940,12 +5320,18 @@ def main(argv: Optional[Sequence[str]] = None, env: Optional[Mapping[str, str]] 
                 load_setup_commands(context.source),
                 env=effective_env,
             )
+        if args.action == "inventory":
+            return manage_worktree_inventory(
+                context,
+                state_dir,
+                env=effective_env,
+            )
         if args.action == "bootstrap":
-            record_worktree_mapping(context, state_dir)
+            record_worktree_mapping(context, state_dir, env=effective_env)
         execute_action(args.action, context, state_dir)
         return 0
     except NothingToDo as exc:
-        if args.action in ("manage", "setup-manage"):
+        if args.action in ("manage", "setup-manage", "inventory"):
             notify_repository_unavailable(exc, effective_env)
         print(str(exc))
         return 0

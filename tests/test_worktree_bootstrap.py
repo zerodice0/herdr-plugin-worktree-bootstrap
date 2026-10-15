@@ -661,6 +661,11 @@ class GitRepositoryTestCase(unittest.TestCase):
         self.source = self.root / "primary checkout"
         self.target = self.root / "feature checkout"
         self.state_dir = self.root / "state"
+        self.herdr_config = self.root / "herdr-config.toml"
+        self.herdr_config.write_text(
+            f'[worktrees]\ndirectory = "{self.root}"\n',
+            encoding="utf-8",
+        )
         run(["git", "init", "-q", os.fspath(self.source)])
         run(["git", "config", "user.name", "Test User"], cwd=self.source)
         run(["git", "config", "user.email", "test@example.com"], cwd=self.source)
@@ -1009,6 +1014,299 @@ class SetupBehaviorTests(GitRepositoryTestCase):
         self.assertFalse((self.target / "marker").exists())
 
 
+class LifecycleAndInventoryTests(GitRepositoryTestCase):
+    def lifecycle_command(self, name, code, timeout=5):
+        return plugin.SetupCommand(name, (sys.executable, "-c", code), timeout)
+
+    def test_version_one_setup_is_loaded_as_on_created_lifecycle(self):
+        self.write_setup(
+            [
+                {
+                    "name": "legacy",
+                    "argv": ["tool", "arg"],
+                    "timeout_seconds": 30,
+                }
+            ]
+        )
+        lifecycle = plugin.load_lifecycle_commands(self.source)
+        self.assertEqual([command.name for command in lifecycle["on_created"]], ["legacy"])
+        self.assertEqual(lifecycle["before_remove"], [])
+        self.assertEqual(lifecycle["after_remove"], [])
+
+    def test_lifecycle_writer_round_trips_all_phases(self):
+        hooks = {
+            "on_created": [plugin.SetupCommand("create", ("create-tool",), 10)],
+            "before_remove": [plugin.SetupCommand("before", ("before-tool",), 20)],
+            "after_remove": [plugin.SetupCommand("after", ("after-tool",), 30)],
+        }
+        plugin.write_lifecycle_commands(self.context, hooks)
+        loaded = plugin.load_lifecycle_commands(self.source)
+        self.assertEqual(loaded, hooks)
+        document = json.loads((self.source / plugin.SETUP_FILE).read_text(encoding="utf-8"))
+        self.assertEqual(document["version"], 2)
+
+    def test_version_two_rejects_unknown_lifecycle_phase(self):
+        control = self.source / plugin.SETUP_FILE
+        control.parent.mkdir(parents=True, exist_ok=True)
+        control.write_text(
+            json.dumps({
+                "version": 2,
+                "hooks": {
+                    "on_created": [],
+                    "before_remove": [],
+                    "after_remove": [],
+                    "during_remove": [],
+                },
+            }),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(plugin.BootstrapError, "unknown lifecycle hook"):
+            plugin.load_lifecycle_commands(self.source)
+
+    def test_inventory_lifecycle_editor_configures_before_remove(self):
+        answers = iter(
+            [
+                "2",
+                "n",
+                "Stop services",
+                "stop-services --worktree",
+                "45",
+                "q",
+                "q",
+            ]
+        )
+        output = []
+        self.assertEqual(
+            plugin.manage_lifecycle_configuration(
+                self.context,
+                self.state_dir,
+                input_fn=lambda prompt: next(answers),
+                output_fn=output.append,
+            ),
+            0,
+        )
+        lifecycle = plugin.load_lifecycle_commands(self.source)
+        self.assertEqual(
+            lifecycle["before_remove"],
+            [plugin.SetupCommand("Stop services", ("stop-services", "--worktree"), 45)],
+        )
+
+    def test_inventory_reconciles_git_branch_and_residue_state(self):
+        plugin.record_worktree_mapping(self.context, self.state_dir)
+        active = plugin.collect_worktree_inventory(self.source, self.state_dir)
+        feature = next(item for item in active if item.branch == "feature")
+        self.assertEqual(feature.status, "active")
+        self.assertTrue(feature.registered)
+        run(["git", "worktree", "remove", os.fspath(self.target)], cwd=self.source)
+        branch_only = plugin.collect_worktree_inventory(self.source, self.state_dir)
+        feature = next(item for item in branch_only if item.branch == "feature")
+        self.assertEqual(feature.status, "branch-only")
+        (self.target / "ios").mkdir(parents=True)
+        (self.target / "ios" / "cache").write_text("generated", encoding="utf-8")
+        residue = plugin.collect_worktree_inventory(self.source, self.state_dir)
+        feature = next(item for item in residue if item.branch == "feature")
+        self.assertEqual(feature.status, "residue")
+        self.assertEqual(feature.leftover.entry_count, 1)
+
+    def test_inventory_discovers_unrecorded_residue_under_configured_root(self):
+        worktree_root = self.root / "managed-worktrees"
+        orphan = worktree_root / self.source.name / "old-feature" / "ios"
+        orphan.mkdir(parents=True)
+        (orphan / "cache").write_text("generated", encoding="utf-8")
+        items = plugin.collect_worktree_inventory(
+            self.source,
+            self.state_dir,
+            worktree_root=worktree_root,
+        )
+        discovered = next(item for item in items if item.worktree_path.name == "old-feature")
+        self.assertEqual(discovered.status, "residue")
+        self.assertFalse(discovered.provenance_verified)
+        self.assertIsNone(discovered.branch)
+
+    def test_inventory_reads_configured_worktree_root(self):
+        config = self.root / "config.toml"
+        configured = self.root / "managed worktrees"
+        config.write_text(
+            f'[worktrees]\ndirectory = "{configured}"\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            plugin.load_worktree_directory({}, config_path=config),
+            configured.resolve(),
+        )
+
+    def test_before_remove_lifecycle_runs_with_structured_environment(self):
+        marker_code = (
+            "import os; from pathlib import Path; "
+            "(Path(os.environ['HERDR_PRIMARY_PATH']) / 'before-marker').write_text("
+            "os.environ['HERDR_WORKTREE_BRANCH'])"
+        )
+        plugin.write_lifecycle_commands(
+            self.context,
+            {
+                "on_created": [],
+                "before_remove": [self.lifecycle_command("before", marker_code)],
+                "after_remove": [],
+            },
+        )
+        plugin.record_worktree_mapping(self.context, self.state_dir)
+        item = next(
+            item
+            for item in plugin.collect_worktree_inventory(self.source, self.state_dir)
+            if item.branch == "feature"
+        )
+        with mock.patch.object(plugin, "query_herdr_workspace_id", return_value="workspace-2"):
+            with mock.patch.object(plugin, "_herdr_command", return_value="/usr/bin/true"):
+                result = plugin.remove_managed_worktree(item, self.state_dir, {})
+        self.assertEqual((self.source / "before-marker").read_text(), "feature")
+        self.assertEqual(result["before_remove_status"], "success")
+        self.assertEqual(result["removal_operation_status"], "requested")
+
+    def test_on_created_lifecycle_receives_structured_environment(self):
+        marker_code = (
+            "import os; from pathlib import Path; "
+            "Path('created-env').write_text('|'.join(["
+            "os.environ['HERDR_WORKTREE_PATH'], "
+            "os.environ['HERDR_PRIMARY_PATH'], "
+            "os.environ['HERDR_WORKTREE_BRANCH']]))"
+        )
+        plugin.write_lifecycle_commands(
+            self.context,
+            {
+                "on_created": [self.lifecycle_command("created", marker_code)],
+                "before_remove": [],
+                "after_remove": [],
+            },
+        )
+        plugin.execute_action("setup", self.context, self.state_dir)
+        target, primary, branch = (self.target / "created-env").read_text().split("|")
+        self.assertEqual(Path(target), self.target.resolve())
+        self.assertEqual(Path(primary), self.source.resolve())
+        self.assertEqual(branch, "feature")
+
+    def test_before_remove_generated_changes_block_unforced_removal(self):
+        plugin.write_lifecycle_commands(
+            self.context,
+            {
+                "on_created": [],
+                "before_remove": [
+                    self.lifecycle_command(
+                        "write output",
+                        "from pathlib import Path; Path('generated').touch()",
+                    )
+                ],
+                "after_remove": [],
+            },
+        )
+        plugin.record_worktree_mapping(self.context, self.state_dir)
+        item = next(
+            item
+            for item in plugin.collect_worktree_inventory(self.source, self.state_dir)
+            if item.branch == "feature"
+        )
+        with mock.patch.object(plugin, "query_herdr_workspace_id", return_value="workspace-2"):
+            with mock.patch.object(plugin, "_herdr_command") as herdr_command:
+                with self.assertRaisesRegex(plugin.BootstrapError, "after before-remove"):
+                    plugin.remove_managed_worktree(item, self.state_dir, {})
+        herdr_command.assert_not_called()
+        mapping = plugin.load_worktree_mapping(self.state_dir, self.target)
+        self.assertEqual(mapping["removal_operation_status"], "blocked")
+
+    def test_after_remove_lifecycle_runs_from_primary_checkout_once(self):
+        marker_code = (
+            "import os; from pathlib import Path; "
+            "Path('after-marker').write_text(os.environ['HERDR_WORKTREE_PATH'])"
+        )
+        plugin.write_lifecycle_commands(
+            self.context,
+            {
+                "on_created": [],
+                "before_remove": [],
+                "after_remove": [self.lifecycle_command("after", marker_code)],
+            },
+        )
+        plugin.record_worktree_mapping(self.context, self.state_dir)
+        run(["git", "worktree", "remove", os.fspath(self.target)], cwd=self.source)
+        event = {
+            "HERDR_PLUGIN_EVENT": "worktree.removed",
+            "HERDR_PLUGIN_EVENT_JSON": json.dumps(
+                {
+                    "event": "worktree.removed",
+                    "data": {
+                        "workspace": {
+                            "worktree": {"repo_root": os.fspath(self.source.resolve())}
+                        },
+                        "worktree": {
+                            "path": os.fspath(self.target.resolve()),
+                            "branch": "feature",
+                            "is_detached": False,
+                        },
+                        "forced": False,
+                    },
+                }
+            ),
+        }
+        plugin.handle_branch_cleanup_event(event, self.state_dir, open_popup=False)
+        plugin.run_after_remove_lifecycle(event, self.state_dir)
+        self.assertEqual((self.source / "after-marker").read_text(), os.fspath(self.target.resolve()))
+        mapping = plugin.load_worktree_mapping(self.state_dir, self.target)
+        self.assertEqual(mapping["after_remove_status"], "success")
+        self.assertEqual(mapping["after_remove_completed_count"], 1)
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
+    def test_leftover_cleanup_rejects_replaced_symlink(self):
+        plugin.record_worktree_mapping(self.context, self.state_dir)
+        run(["git", "worktree", "remove", os.fspath(self.target)], cwd=self.source)
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "keep").write_text("safe", encoding="utf-8")
+        os.symlink(os.fspath(outside), self.target)
+        inspection = plugin.inspect_leftover_path(self.target)
+        self.assertTrue(inspection.is_symlink)
+        with self.assertRaisesRegex(plugin.BootstrapError, "real directory"):
+            plugin.remove_leftover_worktree_files(
+                self.source,
+                self.target,
+                worktree_root=self.root,
+                provenance_verified=True,
+                expected_device=inspection.device,
+                expected_inode=inspection.inode,
+            )
+        self.assertTrue((outside / "keep").exists())
+
+    def test_leftover_cleanup_rejects_registered_worktree(self):
+        inspection = plugin.inspect_leftover_path(self.target)
+        with self.assertRaisesRegex(plugin.BootstrapError, "still registered"):
+            plugin.remove_leftover_worktree_files(
+                self.source,
+                self.target,
+                worktree_root=self.root,
+                provenance_verified=True,
+                expected_device=inspection.device,
+                expected_inode=inspection.inode,
+            )
+
+    def test_leftover_cleanup_rejects_path_outside_configured_root(self):
+        run(["git", "worktree", "remove", os.fspath(self.target)], cwd=self.source)
+        (self.target / "ios").mkdir(parents=True)
+        inspection = plugin.inspect_leftover_path(self.target)
+        with self.assertRaisesRegex(plugin.BootstrapError, "outside the configured"):
+            plugin.remove_leftover_worktree_files(
+                self.source,
+                self.target,
+                worktree_root=self.root / "different-root",
+                provenance_verified=True,
+                expected_device=inspection.device,
+                expected_inode=inspection.inode,
+            )
+        self.assertTrue(self.target.exists())
+
+    def test_inventory_parser_has_direct_entrypoints(self):
+        parser = plugin.build_parser()
+        self.assertEqual(parser.parse_args(["inventory-launch"]).action, "inventory-launch")
+        self.assertEqual(parser.parse_args(["inventory"]).action, "inventory")
+
+
 class StateAndManagementTests(GitRepositoryTestCase):
     def test_ignored_picker_candidates_include_nested_paths_without_expanding_directories(self):
         (self.source / ".env").write_text("secret", encoding="utf-8")
@@ -1248,7 +1546,47 @@ class BranchCleanupTests(GitRepositoryTestCase):
                 self.removed_event(branch=None, detached=True), self.state_dir
             )
         self.assertEqual(plugin.list_pending_cleanups(self.state_dir), [])
-        self.assertFalse(mapping_path.exists())
+        self.assertTrue(mapping_path.exists())
+        mapping = plugin.load_worktree_mapping(self.state_dir, self.target)
+        self.assertEqual(mapping["status"], "removed")
+        self.assertIsNone(mapping["branch"])
+
+    def test_leftover_files_are_reviewed_separately_from_the_branch(self):
+        self.record_and_remove_target()
+        leftover = self.target / "ios" / "DerivedData"
+        leftover.mkdir(parents=True)
+        (leftover / "cache").write_text("generated", encoding="utf-8")
+        pending = plugin.handle_branch_cleanup_event(
+            self.removed_event(), self.state_dir, open_popup=False
+        )
+        self.assertTrue(pending["provenance_verified"])
+        answers = iter(["k", "r", self.target.name])
+        plugin.review_pending_cleanups(
+            self.state_dir,
+            input_fn=lambda prompt: next(answers),
+            output_fn=lambda line: None,
+            env={"HERDR_CONFIG_PATH": os.fspath(self.herdr_config)},
+        )
+        self.assertFalse(self.target.exists())
+        self.assertTrue(self.branch_exists("feature"))
+        self.assertEqual(plugin.list_pending_cleanups(self.state_dir), [])
+
+    def test_missing_branch_does_not_hide_leftover_files(self):
+        self.record_and_remove_target()
+        run(["git", "branch", "-D", "feature"], cwd=self.source)
+        leftover = self.target / "ios"
+        leftover.mkdir(parents=True)
+        (leftover / "cache").write_text("generated", encoding="utf-8")
+        plugin.handle_branch_cleanup_event(self.removed_event(), self.state_dir, open_popup=False)
+        answers = iter(["r", self.target.name])
+        plugin.review_pending_cleanups(
+            self.state_dir,
+            input_fn=lambda prompt: next(answers),
+            output_fn=lambda line: None,
+            env={"HERDR_CONFIG_PATH": os.fspath(self.herdr_config)},
+        )
+        self.assertFalse(self.target.exists())
+        self.assertEqual(plugin.list_pending_cleanups(self.state_dir), [])
 
     def test_popup_launch_passes_only_cleanup_id(self):
         completed = subprocess.CompletedProcess([], 0, stdout="{}", stderr="")

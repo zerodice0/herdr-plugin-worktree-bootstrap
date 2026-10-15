@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented here.
 
+## [0.5.0] - 2026-10-16
+
+- Add a Worktree Inventory action that reconciles Git registrations, local branches, recorded creation/removal provenance, and checkout paths.
+- Record the creation commit and other refs pointing at it as best-effort base candidates for newly observed worktrees.
+- Preserve removal tombstones and lifecycle results instead of discarding worktree provenance after removal.
+- Detect ignored files or empty directories left after worktree removal and review them independently from local branches.
+- Require the configured worktree root, recorded provenance, a non-Git real directory, unchanged device/inode, and exact-name confirmation before deleting leftover files; never delete unverified discovered paths.
+- Expand `.herdr/worktree-setup.json` to a version 2 lifecycle schema with `on_created`, `before_remove`, and `after_remove` command phases while retaining version 1 compatibility.
+- Run pre-remove commands only for Inventory-managed removal, fail closed on command errors or newly dirty state, and expose structured worktree context through environment variables.
+- Run post-remove commands from the primary checkout once per recorded worktree generation.
+
 ## [0.4.0] - 2026-08-03
 
 - Show every registered copy path and setup command through a bounded, vertically scrollable viewport.

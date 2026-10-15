@@ -1,14 +1,15 @@
 # Herdr Worktree Bootstrap
 
-`zerodice0.worktree-bootstrap` prepares new [Herdr](https://herdr.dev/) Git worktrees by copying explicitly selected local files and running setup commands. After Herdr removes a worktree, it also offers an interactive review before deleting the associated local branch.
+`zerodice0.worktree-bootstrap` prepares new [Herdr](https://herdr.dev/) Git worktrees, inventories active and removed checkouts, and reviews branches and leftover files after removal. Repository-local lifecycle commands can run after creation, before an Inventory-managed removal, and after any observed removal event.
 
 It is deliberately conservative:
 
 - only repository-relative paths listed by the user are considered;
 - only Git-ignored, untracked paths are copied;
 - directories replace the target directory instead of merging into it;
-- setup commands are argv arrays, run sequentially without a shell, and stop on the first failure;
+- lifecycle commands are argv arrays, run sequentially without a shell, and stop on the first failure;
 - branch retention is the default, safe deletion uses `git branch -d`, and force deletion requires typing the exact branch name;
+- leftover checkout files are never deleted automatically, and deletion requires verified provenance plus exact-name confirmation;
 - there is no ecosystem detection and no automatic selection of dependency or build output directories.
 
 The plugin supports Herdr 0.7.0 or newer on Linux and macOS. It requires Python 3.9 or newer and uses only the Python standard library. It does not require `jq` or third-party Python packages. When `fzf` is available, the management popup uses it as an optional multi-select path picker; the typed-path fallback remains available without it.
@@ -18,7 +19,7 @@ The plugin supports Herdr 0.7.0 or newer on Linux and macOS. It requires Python 
 Install the tagged release from GitHub:
 
 ```sh
-herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.4.0
+herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.5.0
 ```
 
 For local development, link this checkout:
@@ -27,7 +28,7 @@ For local development, link this checkout:
 herdr plugin link .
 ```
 
-Copying and setup are opt-in per repository. If neither control file exists in the primary checkout, worktree creation does not change project files. Branch cleanup review is global but never deletes a branch without an explicit interactive choice.
+Copying and lifecycle commands are opt-in per repository. If neither control file exists in the primary checkout, worktree creation does not change project files. Branch and leftover-file cleanup never happens without an explicit interactive choice.
 
 ## Copy local files
 
@@ -55,33 +56,51 @@ A listed symbolic link is copied as a link, including broken and external-target
 
 The management popup creates the copy list when the first path is added and adds only `/.herdr/worktree-copy.list` to the repository's shared `.git/info/exclude`. It never modifies the tracked `.gitignore`. If you create the control file manually, keep it local by adding the same anchored entry yourself.
 
-## Run setup commands
+## Configure lifecycle commands
 
 Create `.herdr/worktree-setup.json` in the primary checkout:
 
 ```json
 {
-  "version": 1,
-  "commands": [
-    {
-      "name": "Install dependencies",
-      "argv": ["npm", "ci"],
-      "timeout_seconds": 900
-    },
-    {
-      "name": "Fetch Flutter packages",
-      "argv": ["flutter", "pub", "get"],
-      "timeout_seconds": 900
-    }
-  ]
+  "version": 2,
+  "hooks": {
+    "on_created": [
+      {
+        "name": "Install dependencies",
+        "argv": ["npm", "ci"],
+        "timeout_seconds": 900
+      }
+    ],
+    "before_remove": [
+      {
+        "name": "Stop project services",
+        "argv": ["./tools/stop-local-services"],
+        "timeout_seconds": 60
+      }
+    ],
+    "after_remove": []
+  }
 }
 ```
 
-Every command runs in the target worktree root. Commands run in array order. A non-zero exit, timeout, or missing executable stops the sequence immediately. The plugin does not invoke a shell, expand environment variables in argv, or implement platform branches.
+`on_created` runs in the new worktree after local files are copied. `before_remove` runs in an active worktree only when removal is started from **Worktree inventory**; a failure blocks removal. `after_remove` runs in the primary checkout after a `worktree.removed` event, including removals started outside Inventory. Version 1 files containing `commands` remain supported and are interpreted as `on_created` commands; the editors migrate them to version 2 when they next save.
+
+Commands run in array order. A non-zero exit, timeout, or missing executable stops the phase immediately. The plugin does not invoke a shell, expand environment variables in argv, or implement platform branches. Long-running processes such as development servers and file watchers are not suitable lifecycle commands.
+
+Every phase receives these string environment variables:
+
+| Variable | Meaning |
+| --- | --- |
+| `HERDR_WORKTREE_PATH` | Absolute checkout path being created or removed. |
+| `HERDR_PRIMARY_PATH` | Absolute primary checkout path. |
+| `HERDR_WORKTREE_BRANCH` | Local branch, or an empty string for detached/unknown state. |
+| `HERDR_WORKTREE_HEAD` | Known worktree HEAD, or an empty string. |
+| `HERDR_REMOVAL_FORCED` | `1` for a forced removal, otherwise `0`. |
+| `HERDR_LEFTOVER_DETECTED` | `1` when files remain after removal, otherwise `0`. |
 
 This file is also local opt-in configuration. When the management popup sees it, the popup adds `/.herdr/worktree-setup.json` to `.git/info/exclude`.
 
-Use setup for terminating jobs such as `npm ci`, `bundle install`, or `flutter pub get`. Long-running processes such as `npm run dev`, file watchers, and `flutter run` are outside v1's scope.
+Use `on_created` for terminating jobs such as `npm ci`, `bundle install`, or `flutter pub get`. Use `before_remove` to stop project-scoped writers that could recreate ignored build output during removal. Commands should be safe to retry: if Herdr refuses removal, a later Inventory attempt runs `before_remove` again.
 
 ## Actions
 
@@ -89,13 +108,14 @@ The plugin exposes these Herdr actions:
 
 | Action | Behavior |
 | --- | --- |
-| `bootstrap` | Copy eligible paths, then run setup commands. Setup never runs if copying fails. |
+| `bootstrap` | Copy eligible paths, then run `on_created` commands. Commands never run if copying fails. |
 | `sync` | Copy eligible paths only. |
-| `setup` | Run setup commands only. |
+| `setup` | Run `on_created` commands only. |
 | `status` | Validate both control files and show source/target presence, skip reasons, and the last result. |
 | `manage` | Open a theme-aware responsive dashboard for files, setup commands, status, and manual sync. |
 | `configure-setup` | Open the setup command editor directly. |
 | `review-branch-cleanup` | Review branch cleanups that could not be shown immediately or were skipped. |
+| `worktree-inventory` | Reconcile Git registrations, branches, recorded provenance, and checkout paths; configure lifecycle phases and start reviewed removal or residue cleanup. |
 
 Invoke an action from the Herdr UI, or from the CLI:
 
@@ -104,6 +124,7 @@ herdr plugin action invoke zerodice0.worktree-bootstrap.status
 herdr plugin action invoke zerodice0.worktree-bootstrap.manage
 herdr plugin action invoke zerodice0.worktree-bootstrap.configure-setup
 herdr plugin action invoke zerodice0.worktree-bootstrap.review-branch-cleanup
+herdr plugin action invoke zerodice0.worktree-bootstrap.worktree-inventory
 ```
 
 The management popup follows the active Herdr theme and uses the Herdr popup frame as its only border. It uses a bounded 96-column by 24-row popup instead of scaling indefinitely with large terminals; Herdr constrains fixed-cell popups to the available client area on smaller screens. The direct setup editor uses a smaller 84-column by 20-row popup. The default dashboard includes every selected copy-plan entry and every setup command without filling the screen with tracked files. When the content exceeds the viewport, a persistent `SCROLL` row shows the visible range, total row count, and position track. Press `j` or Down Arrow to move down and `k` or Up Arrow to move up; Page Up and Page Down move by one viewport. Press `v` to reveal eligible root paths and blocked-path counts. The action footer stays on one line when it fits and wraps only at complete action boundaries on narrower terminals. Navigation redraws are batched in place instead of clearing the terminal between cursor movements.
@@ -133,9 +154,9 @@ herdr server reload-config
 
 For example, when `[keys].prefix` is `"ctrl+p"`, press `Ctrl+P` and then `B`. The same dashboard remains searchable as **Worktree bootstrap settings** from Herdr's plugin actions menu.
 
-### Configure setup commands in the management popup
+### Configure creation commands in the management popup
 
-Open the management popup and press `c`, or invoke `configure-setup` directly. The setup editor supports single-key choices:
+Open the management popup and press `c`, or invoke `configure-setup` directly. This editor manages the `on_created` phase. The setup editor supports single-key choices:
 
 ```text
 [n] new       [e] edit       [x] delete
@@ -149,15 +170,40 @@ When adding or editing a command, enter its display name, one argv command line,
 
 `r` runs the saved setup immediately in the current target worktree. The same fail-fast, timeout, and command-not-found rules used by automatic bootstrap apply to this manual run.
 
+## Worktree inventory
+
+Open **Worktree inventory and lifecycle** to reconcile three independent sources of truth:
+
+- Git registrations from `git worktree list`;
+- local branches and whether they still exist;
+- recorded creation/removal provenance and actual checkout paths, including ignored residue under `[worktrees].directory` (default `~/.herdr/worktrees`).
+
+Each row reports the branch, Git registration, path presence, provenance status, creation commit, candidate base refs, lifecycle results, and a bounded residue summary. Git does not store the original base branch after worktree creation, so “base candidates” are the other local or remote refs that pointed at the creation commit when the plugin observed `worktree.created`; they are evidence, not a guaranteed ancestry claim.
+
+| Inventory state | Meaning |
+| --- | --- |
+| `primary` | Primary non-bare checkout. It cannot be removed here. |
+| `active` | Git registration and a real checkout directory both exist. |
+| `missing` | Git still registers the worktree, but its checkout path is missing or unsafe. |
+| `branch-only` | The worktree is no longer registered and no checkout path remains, but its local branch exists. |
+| `residue` | The worktree is no longer registered, but a path remains and can block recreation. |
+| `removed` | Recorded worktree, branch, and checkout path are all absent. |
+
+Inventory can start Herdr removal for an active worktree. It checks dirty state, requires typing the exact branch or directory name, runs `before_remove`, checks dirty state again, and then calls `herdr worktree remove`. A dirty checkout is removed with `--force` only after that explicit confirmation. Removal started from Herdr's built-in action or another tool cannot run `before_remove`; use Inventory when the pre-remove phase matters.
+
+Residue cleanup is a separate action from branch cleanup. It is offered only for a path whose provenance was recorded while it was a worktree. Before deletion, the plugin rechecks that the path is strictly below the absolute `[worktrees].directory`, its canonical parent has not changed, it is a real directory rather than a symbolic link, it is not registered by Git, it is not recognized as any Git repository, and it still has the displayed device/inode. The exact directory name must then be typed. Directories merely discovered by scanning the configured root are shown as `unverified` and cannot be deleted by the plugin. A residue outside the configured root remains visible but must be handled manually.
+
+Choose **Lifecycle** inside Inventory to add, edit, delete, or reorder commands for all three phases. Changes are validated and atomically saved in the version 2 schema above.
+
 ## Automatic worktree bootstrap
 
-The `worktree.created` event runs `bootstrap`. Herdr event commands are post-creation asynchronous hooks: the worktree and its initial pane already exist when bootstrap starts. Do not depend on bootstrap completing before a separate automatic build or development server starts. That kind of cross-hook ordering is not provided by this plugin.
+The `worktree.created` event records the creation commit and candidate base refs, then runs `bootstrap`. Herdr event commands are post-creation asynchronous hooks: the worktree and its initial pane already exist when bootstrap starts. Do not depend on bootstrap completing before a separate automatic build or development server starts. That kind of cross-hook ordering is not provided by this plugin.
 
 The source is always the primary non-bare checkout from `git worktree list --porcelain`. The plugin verifies that source and target share the same common Git directory. It safely does nothing for the primary checkout itself, bare repositories, unavailable primary checkouts, or repositories with no control files.
 
 ## Branch cleanup after worktree removal
 
-Herdr intentionally removes a worktree checkout without deleting its branch. This plugin listens for `worktree.removed`, records a pending cleanup request, inspects the local branch, and attempts to open a session-modal terminal popup.
+Herdr intentionally removes a worktree checkout without deleting its branch. This plugin listens for `worktree.removed`, records a pending cleanup request, inspects the local branch and checkout path independently, runs `after_remove`, and attempts to open a session-modal terminal popup.
 
 The popup shows:
 
@@ -165,7 +211,8 @@ The popup shows:
 - whether the branch is merged into the detected default branch;
 - upstream and ahead/behind information when available;
 - whether another worktree still uses the branch;
-- whether the worktree itself was removed with `--force`.
+- whether the worktree itself was removed with `--force`;
+- whether the removed checkout path has reappeared or still contains files, with bounded file-count, size, and path samples.
 
 The choices are:
 
@@ -174,18 +221,19 @@ The choices are:
 - **Force delete**: display an unmerged-commit warning and require typing the exact branch name before running `git branch -D`.
 - **Skip**: keep the request pending for later review.
 
+After the branch decision, any leftover checkout directory gets its own decision: keep it, remove it after exact-name confirmation, or leave it pending. Keeping or deleting a branch never implies deleting checkout files, and keeping or deleting checkout files never changes a branch.
+
 In the interactive popup, press `D`, `F`, `S`, or `Q` to act immediately; no Enter is required. Press Enter by itself to keep the branch. The action footer stays on one line when it fits and wraps into balanced, complete action groups on narrower terminals. The exact branch-name confirmation for force deletion intentionally remains a typed value followed by Enter. If direct key reading or a visible action footer is unavailable, the popup falls back to the same choices through normal line input.
 
 `main`, `master`, `develop`, `development`, `trunk`, the detected default branch, and any branch checked out in another worktree cannot be deleted from the popup. Branch state is inspected again immediately before deletion to close the race between display and confirmation. Remote branches are displayed through upstream status but are never deleted.
 
-The hook runs after Herdr has removed the worktree. Herdr v1 does not expose a pre-remove interception or native yes/no dialog API, so this plugin cannot modify the built-in removal confirmation. If no foreground client exists or another popup is busy, the handler never deletes anything; the resolved request remains under `HERDR_PLUGIN_STATE_DIR` and can be reopened with:
+The hook runs after Herdr has attempted removal, so a process such as Xcode can recreate an ignored directory after Git has unregistered the worktree. The review re-inspects the path when it opens instead of trusting event-time state. If no foreground client exists or another popup is busy, the handler never deletes anything; the unresolved request remains under `HERDR_PLUGIN_STATE_DIR` and can be reopened with:
 
 ```sh
 herdr plugin action invoke zerodice0.worktree-bootstrap.review-branch-cleanup
 ```
 
-The plugin caches worktree-to-primary-checkout provenance when `worktree.created` fires so removal events with a missing workspace snapshot can still be reviewed safely. Detached worktrees have no local branch cleanup and are ignored.
-If neither the removal event nor that cache can identify and validate the primary checkout, the event is logged and no cleanup request or branch deletion is attempted.
+The plugin caches worktree-to-primary-checkout provenance when `worktree.created` fires so removal events with a missing workspace snapshot can still be reviewed safely. Detached worktrees have no local branch cleanup, but their removal history and `after_remove` result remain visible in Inventory. If neither the removal event nor that cache can identify and validate the primary checkout, the event is logged and no cleanup request, lifecycle command, or deletion is attempted.
 
 ### Theme-aware cleanup dialog
 
@@ -199,7 +247,7 @@ Before replacing a configured path, the plugin stages every eligible source. Exi
 
 Per-target locks live under `HERDR_PLUGIN_STATE_DIR`, preventing a manual action and an event from changing the same target concurrently. Interrupted or stale target transaction directories are cleaned up on the next run. File modes and executable bits are preserved.
 
-Plugin logs contain command names, counts, skip reasons, failures, and exit codes. The plugin does not print file contents, argv values, environment values, or credential values. Child process stdout and stderr still flow to Herdr's command log, so setup commands remain responsible for not printing secrets.
+Plugin logs contain command names, counts, skip reasons, failures, and exit codes. The plugin does not print file contents, argv values, environment values, or credential values. Child process stdout and stderr still flow to Herdr's command log, so lifecycle commands remain responsible for not printing secrets.
 
 Inspect recent Herdr command logs with:
 
@@ -209,7 +257,7 @@ herdr plugin log list --plugin zerodice0.worktree-bootstrap --limit 20
 
 ## Choosing what to copy
 
-Prefer setup commands for reproducible dependency and build outputs. Do not add `node_modules`, `.dart_tool`, build trees, or caches merely because they are ignored. Copy only local state that cannot be regenerated cheaply and that you intentionally want duplicated into every new worktree.
+Prefer `on_created` commands for reproducible dependency and build outputs. Do not add `node_modules`, `.dart_tool`, build trees, or caches merely because they are ignored. Copy only local state that cannot be regenerated cheaply and that you intentionally want duplicated into every new worktree.
 
 ## Upgrade and rollback
 
@@ -220,7 +268,7 @@ Before validation, find and disable the old plugin:
 ```sh
 herdr plugin list
 herdr plugin disable OLD_PLUGIN_ID
-herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.4.0
+herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.5.0
 ```
 
 To roll back, disable this plugin and re-enable the previous one. Control files are left untouched:

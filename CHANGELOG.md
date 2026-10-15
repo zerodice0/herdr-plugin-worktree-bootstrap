@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented here.
 
-## [Unreleased]
+## [0.6.0] - 2026-10-16
 
 - Add read-only `status --json` and `inventory --json` responses with a versioned envelope and machine-readable errors.
 - Add a `branch_cleanup_popup` setting to suppress removal-event popups and notifications while retaining queued cleanup and `after_remove` commands.

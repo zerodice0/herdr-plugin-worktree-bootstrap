@@ -150,6 +150,14 @@ class LeftoverInspection:
 
 
 @dataclasses.dataclass(frozen=True)
+class CleanupSnapshot:
+    record: Mapping[str, Any]
+    branch: BranchInspection
+    leftover: LeftoverInspection
+    resolved: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
 class WorktreeInventoryItem:
     repo_root: Path
     worktree_path: Path
@@ -1672,7 +1680,7 @@ def remove_leftover_worktree_files(
     provenance_verified: bool,
     expected_device: Optional[int],
     expected_inode: Optional[int],
-) -> None:
+) -> str:
     repo_root = _validate_cleanup_repository(_canonical(repo_root))
     worktree_path = _absolute_path(worktree_path)
     if worktree_root is None:
@@ -1693,7 +1701,7 @@ def remove_leftover_worktree_files(
         raise BootstrapError("refusing to remove a path still registered as a Git worktree")
     inspection = inspect_leftover_path(worktree_path)
     if not inspection.exists:
-        return
+        return "absent"
     if not inspection.is_directory or inspection.is_symlink:
         raise BootstrapError("refusing to remove a leftover path that is not a real directory")
     if _canonical(worktree_path.parent) != worktree_path.parent:
@@ -1713,12 +1721,17 @@ def remove_leftover_worktree_files(
         raise BootstrapError("refusing to remove a path that Git still recognizes as a repository")
     try:
         shutil.rmtree(worktree_path)
+    except FileNotFoundError:
+        if not os.path.lexists(worktree_path):
+            return "absent"
+        raise BootstrapError("leftover directory changed during cleanup; review it again")
     except OSError as exc:
         raise BootstrapError(f"could not remove leftover worktree files: {exc}") from exc
     if os.path.lexists(worktree_path):
         raise BootstrapError(
             "leftover path was recreated during cleanup; stop processes writing to it and retry"
         )
+    return "removed"
 
 
 def _pending_cleanup_dir(state_dir: Path) -> Path:
@@ -1744,12 +1757,9 @@ def list_pending_cleanups(state_dir: Path) -> List[Mapping[str, Any]]:
         return []
     records: List[Mapping[str, Any]] = []
     for path in sorted(directory.glob("*.json")):
-        document = _read_json_file(path)
-        if document is None:
-            continue
-        record = dict(document)
-        record["_path"] = os.fspath(path)
-        records.append(record)
+        record = _load_pending_cleanup(state_dir, path.stem)
+        if record is not None:
+            records.append(record)
     return sorted(records, key=lambda item: str(item.get("created_at", "")))
 
 
@@ -1850,30 +1860,33 @@ def queue_branch_cleanup(env: Mapping[str, str], state_dir: Path) -> Mapping[str
     if branch_check.returncode != 0:
         raise BootstrapError("removed worktree reported an invalid branch name")
     cleanup_id = pending_cleanup_id(repo_root, worktree_path, branch)
-    removed_record = mark_worktree_removed(
-        state_dir,
-        worktree_path,
-        repo_root,
-        common_git_dir=_git_common_dir(repo_root),
-        branch=branch,
-        forced=forced,
-    )
-    leftover = inspect_leftover_path(worktree_path)
-    payload: Dict[str, Any] = {
-        "version": 2,
-        "id": cleanup_id,
-        "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "repo_root": os.fspath(repo_root),
-        "worktree_path": os.fspath(worktree_path),
-        "branch": branch,
-        "forced_worktree_removal": forced,
-        "status": "pending",
-        "common_git_dir": removed_record.get("common_git_dir"),
-        "provenance_verified": bool(removed_record.get("provenance_verified")),
-        "leftover_detected_at_queue": leftover.exists,
-    }
-    _atomic_write_json(pending_cleanup_path(state_dir, cleanup_id), payload)
-    return payload
+    with _cleanup_transaction(state_dir, cleanup_id):
+        existing = _load_pending_cleanup(state_dir, cleanup_id)
+        if existing is not None:
+            return {key: value for key, value in existing.items() if key != "_path"}
+        removed_record = mark_worktree_removed(
+            state_dir,
+            worktree_path,
+            repo_root,
+            common_git_dir=_git_common_dir(repo_root),
+            branch=branch,
+            forced=forced,
+        )
+        payload: Dict[str, Any] = {
+            "version": 2,
+            "id": cleanup_id,
+            "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "repo_root": os.fspath(repo_root),
+            "worktree_path": os.fspath(worktree_path),
+            "branch": branch,
+            "forced_worktree_removal": forced,
+            "status": "pending",
+            "common_git_dir": removed_record.get("common_git_dir"),
+            "provenance_verified": bool(removed_record.get("provenance_verified")),
+            "leftover_detected_at_queue": inspect_leftover_path(worktree_path).exists,
+        }
+        _atomic_write_json(pending_cleanup_path(state_dir, cleanup_id), payload)
+        return payload
 
 
 def _ref_exists(repo_root: Path, ref: str) -> bool:
@@ -1988,10 +2001,10 @@ def delete_local_branch(
     *,
     force: bool = False,
     expected_oid: Optional[str] = None,
-) -> None:
+) -> str:
     inspection = inspect_branch(repo_root, branch)
     if not inspection.exists:
-        return
+        return "already_absent"
     if inspection.protected:
         raise BootstrapError(f"refusing to delete protected branch: {branch}")
     if inspection.used_by_worktrees:
@@ -2001,8 +2014,11 @@ def delete_local_branch(
     flag = "-D" if force else "-d"
     result = _run_git(inspection.repo_root, ["branch", flag, "--", inspection.branch], check=False)
     if result.returncode != 0:
+        if not _ref_exists(inspection.repo_root, f"refs/heads/{inspection.branch}"):
+            return "already_absent"
         detail = result.stderr.strip() or "Git refused the branch deletion"
         raise BootstrapError(detail)
+    return "deleted_forcibly" if force else "deleted_safely"
 
 
 def _record_cleanup_result(
@@ -2028,32 +2044,243 @@ def _record_cleanup_result(
     _atomic_write_json(state_dir / BRANCH_CLEANUP_DIR / "last-result.json", payload)
 
 
-def _update_pending_cleanup_record(
-    state_dir: Path,
-    record: Mapping[str, Any],
-    values: Mapping[str, Any],
-) -> Mapping[str, Any]:
-    cleanup_id = record.get("id")
-    if not isinstance(cleanup_id, str):
-        raise BootstrapError("pending cleanup record has no valid id")
-    payload = {key: value for key, value in record.items() if key != "_path"}
-    payload.update(values)
-    _atomic_write_json(pending_cleanup_path(state_dir, cleanup_id), payload)
-    result = dict(payload)
-    result["_path"] = os.fspath(pending_cleanup_path(state_dir, cleanup_id))
-    return result
+@contextlib.contextmanager
+def _cleanup_transaction(state_dir: Path, cleanup_id: str) -> Iterable[None]:
+    # The stable lock is separate from the replaceable/unlinked request file.
+    pending_cleanup_path(state_dir, cleanup_id)
+    lock_path = state_dir / BRANCH_CLEANUP_DIR / "locks" / f"{cleanup_id}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def _resolve_pending_cleanup(
+def _load_pending_cleanup(
+    state_dir: Path, cleanup_id: str
+) -> Optional[Mapping[str, Any]]:
+    path = pending_cleanup_path(state_dir, cleanup_id)
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise BootstrapError(
+            f"cannot read pending branch cleanup record: {exc}", code="invalid_record"
+        ) from exc
+    if (
+        not isinstance(document, dict)
+        or document.get("id") != cleanup_id
+        or any(
+            not isinstance(document.get(key), str) or not document[key]
+            for key in ("repo_root", "branch", "worktree_path", "created_at")
+        )
+        or document.get("branch_outcome") not in (
+            None, "kept", "deleted_safely", "deleted_forcibly", "already_absent"
+        )
+        or document.get("checkout_outcome") not in (None, "kept", "removed", "absent")
+        or (
+            document.get("common_git_dir") is not None
+            and not isinstance(document["common_git_dir"], str)
+        )
+        or (
+            "provenance_verified" in document
+            and not isinstance(document["provenance_verified"], bool)
+        )
+    ):
+        raise BootstrapError("invalid pending branch cleanup record", code="invalid_record")
+    return dict(document, _path=os.fspath(path))
+
+
+def _inspect_cleanup(record: Mapping[str, Any]) -> CleanupSnapshot:
+    try:
+        repo_root = _validate_cleanup_repository(
+            Path(record["repo_root"]), record.get("common_git_dir")
+        )
+        branch = inspect_branch(repo_root, record["branch"])
+        leftover = inspect_leftover_path(Path(record["worktree_path"]))
+    except BootstrapError as exc:
+        raise BootstrapError(str(exc), code="inspection_failed") from exc
+    return CleanupSnapshot(record, branch, leftover)
+
+
+def _save_cleanup_locked(state_dir: Path, record: Mapping[str, Any]) -> None:
+    _atomic_write_json(
+        pending_cleanup_path(state_dir, record["id"]),
+        {key: value for key, value in record.items() if key != "_path"},
+    )
+
+
+def _cleanup_report(snapshot: CleanupSnapshot) -> Mapping[str, Any]:
+    record = snapshot.record
+    return {
+        "ok": True,
+        "id": record["id"],
+        "branch": record["branch"],
+        "worktree_path": record["worktree_path"],
+        "branch_outcome": record.get("branch_outcome"),
+        "checkout_outcome": record.get("checkout_outcome"),
+        "resolved": snapshot.resolved,
+        "needs": (
+            None if snapshot.resolved else (
+                "branch_decision" if record.get("branch_outcome") is None else "checkout_decision"
+            )
+        ),
+    }
+
+
+def _transition_cleanup(
     state_dir: Path,
-    record: Mapping[str, Any],
-    outcome: str,
-) -> None:
-    _record_cleanup_result(state_dir, record, outcome)
-    cleanup_id = record.get("id")
-    if isinstance(cleanup_id, str):
-        with contextlib.suppress(FileNotFoundError):
+    cleanup_id: str,
+    *,
+    decision: Optional[str] = None,
+    confirm: Optional[str] = None,
+    checkout: Optional[str] = None,
+    confirm_checkout: Optional[str] = None,
+    env: Mapping[str, str],
+    expected: Optional[CleanupSnapshot] = None,
+    reconcile_only: bool = False,
+    missing_ok: bool = False,
+    checkout_only: bool = False,
+) -> Optional[CleanupSnapshot]:
+    """Load, inspect and transition one request; never wait for user input here."""
+    with _cleanup_transaction(state_dir, cleanup_id):
+        loaded = _load_pending_cleanup(state_dir, cleanup_id)
+        if loaded is None:
+            if missing_ok:
+                return None
+            raise BootstrapError("branch cleanup request not found", code="cleanup_not_found")
+        if expected is not None:
+            identity = (
+                "id", "repo_root", "branch", "worktree_path", "created_at",
+                "common_git_dir", "provenance_verified",
+            )
+            if any(loaded.get(key) != expected.record.get(key) for key in identity):
+                raise BootstrapError(
+                    "cleanup request changed after it was displayed; review it again",
+                    code="invalid_record",
+                )
+        snapshot = _inspect_cleanup(loaded)
+        record = dict(loaded)
+        branch, leftover = snapshot.branch, snapshot.leftover
+        # A competing actor's saved partial decision wins over an old menu choice.
+        if expected is not None and any(
+            record.get(key) != expected.record.get(key)
+            for key in ("branch_outcome", "checkout_outcome")
+        ):
+            decision = checkout = None
+            reconcile_only = True
+        if not reconcile_only:
+            # Combined confirmations are checked before either action is committed.
+            if checkout == "remove" and confirm_checkout != leftover.path.name:
+                raise BootstrapError(
+                    f"checkout confirmation must exactly match {leftover.path.name!r}",
+                    code="confirmation_mismatch",
+                )
+            if (
+                record.get("branch_outcome") is None and branch.exists
+                and decision in ("delete", "force") and confirm != record["branch"]
+            ):
+                raise BootstrapError(
+                    f"branch confirmation must exactly match {record['branch']!r}",
+                    code="confirmation_mismatch",
+                )
+            if expected is not None:
+                if (
+                    decision is not None and record.get("branch_outcome") is None
+                    and branch.exists and branch.head_oid != expected.branch.head_oid
+                ):
+                    raise BootstrapError(
+                        "branch changed after it was displayed; review it again",
+                        code="inspection_failed",
+                    )
+                if (
+                    checkout is not None and leftover.exists
+                    and (leftover.device, leftover.inode)
+                    != (expected.leftover.device, expected.leftover.inode)
+                ):
+                    raise BootstrapError(
+                        "leftover directory changed after it was displayed; review it again",
+                        code="inspection_failed",
+                    )
+        if record.get("branch_outcome") is None:
+            if not branch.exists:
+                record["branch_outcome"] = "already_absent"
+            elif not reconcile_only and not checkout_only:
+                if decision is None:
+                    raise BootstrapError("a branch decision is required", code="decision_required")
+                if decision == "keep":
+                    record["branch_outcome"] = "kept"
+                elif decision in ("delete", "force"):
+                    if branch.protected:
+                        raise BootstrapError(
+                            f"refusing to delete protected branch: {branch.branch}",
+                            code="branch_protected",
+                        )
+                    if branch.used_by_worktrees:
+                        raise BootstrapError(
+                            "refusing to delete a branch used by another worktree",
+                            code="branch_in_use",
+                        )
+                    force = decision == "force"
+                    try:
+                        record["branch_outcome"] = delete_local_branch(
+                            branch.repo_root, branch.branch, force=force,
+                            expected_oid=(expected.branch.head_oid if expected else branch.head_oid),
+                        )
+                    except BootstrapError as exc:
+                        _record_cleanup_result(
+                            state_dir, record,
+                            "force_delete_failed" if force else "safe_delete_failed",
+                            error=str(exc),
+                        )
+                        raise BootstrapError(
+                            str(exc), code="force_delete_failed" if force else "safe_delete_refused"
+                        ) from exc
+                else:
+                    raise BootstrapError("invalid branch decision", code="decision_required")
+            if record.get("branch_outcome") is not None:
+                # Persist successful branch work before the independent checkout action.
+                _save_cleanup_locked(state_dir, record)
+        if (
+            (record.get("branch_outcome") is not None or checkout_only)
+            and record.get("checkout_outcome") is None
+        ):
+            if not leftover.exists:
+                record["checkout_outcome"] = "absent"
+            elif not reconcile_only and checkout == "keep":
+                record["checkout_outcome"] = "kept"
+            elif not reconcile_only and checkout == "remove":
+                approved = expected.leftover if expected else leftover
+                try:
+                    record["checkout_outcome"] = remove_leftover_worktree_files(
+                        branch.repo_root, leftover.path,
+                        worktree_root=load_worktree_directory(env),
+                        provenance_verified=bool(record.get("provenance_verified")),
+                        expected_device=approved.device,
+                        expected_inode=approved.inode,
+                    )
+                except BootstrapError as exc:
+                    _record_cleanup_result(
+                        state_dir, record, "checkout_delete_failed", error=str(exc)
+                    )
+                    raise BootstrapError(str(exc), code="checkout_delete_failed") from exc
+        resolved = (
+            record.get("branch_outcome") is not None
+            and record.get("checkout_outcome") is not None
+        )
+        if resolved:
+            outcome = (
+                "kept_with_leftover_files" if record["checkout_outcome"] == "kept"
+                else record["branch_outcome"]
+            )
+            _record_cleanup_result(state_dir, record, outcome)
             pending_cleanup_path(state_dir, cleanup_id).unlink()
+        elif record != loaded:
+            _save_cleanup_locked(state_dir, record)
+        return CleanupSnapshot(record, branch, leftover, resolved)
 
 
 def _yes_no_unknown(value: Optional[bool]) -> str:
@@ -2286,6 +2513,8 @@ def _plain_cleanup_dialog(
         f"Merged into default: {_yes_no_unknown(inspection.merged_into_default)}",
         f"Upstream: {_safe_terminal_text(inspection.upstream or 'none')}",
     ]
+    if record.get("branch_outcome") is not None:
+        lines.append(f"Saved branch decision: {record['branch_outcome']}")
     if inspection.ahead is not None and inspection.behind is not None:
         lines.append(f"Upstream distance: ahead {inspection.ahead}, behind {inspection.behind}")
     lines.append("Remote branches are never deleted by this plugin.")
@@ -2321,6 +2550,8 @@ def render_cleanup_dialog(
 
     width = max(MIN_ACTION_FOOTER_COLUMNS, min(columns, 88))
     status, status_role = _cleanup_status(inspection)
+    if record.get("branch_outcome") is not None:
+        status, status_role = f"BRANCH DECIDED · {record['branch_outcome']}", "muted"
     lines = [
         "",
         _flat_line(
@@ -2380,7 +2611,9 @@ def render_cleanup_dialog(
                 color_enabled=color_enabled,
             )
         )
-    if inspection.protected:
+    if record.get("branch_outcome") is not None:
+        advice = StyledSegment("Choose independently whether to keep or remove leftover files.", "warning")
+    elif inspection.protected:
         advice = StyledSegment("This protected/default branch cannot be deleted here.", "danger", bold=True)
     elif inspection.used_by_worktrees:
         advice = StyledSegment("This branch is still checked out in another worktree.", "warning", bold=True)
@@ -2411,8 +2644,15 @@ def render_cleanup_dialog(
 
     lines.extend(["", _flat_separator(width, palette, color_enabled=color_enabled)])
     blocked = inspection.protected or bool(inspection.used_by_worktrees)
-    if blocked:
+    if record.get("branch_outcome") is not None:
         actions: List[ActionSpec] = [
+            ("ENTER", "Keep files", "accent"),
+            ("R", "Remove files…", "danger"),
+            ("S", "Later", "accent"),
+            ("Q", "Close", "accent"),
+        ]
+    elif blocked:
+        actions = [
             ("ENTER", "Keep", "accent"),
             ("S", "Later", "accent"),
             ("Q", "Close", "accent"),
@@ -2503,7 +2743,8 @@ def read_single_key(
     *,
     input_fd: Optional[int] = None,
     output_stream: Optional[Any] = None,
-) -> str:
+    timeout_seconds: Optional[float] = None,
+) -> Optional[str]:
     """Read one key without echo, restoring terminal state on every exit path."""
 
     file_descriptor = sys.stdin.fileno() if input_fd is None else input_fd
@@ -2518,13 +2759,22 @@ def read_single_key(
     stream.flush()
     try:
         termios.tcsetattr(file_descriptor, termios.TCSADRAIN, new_attributes)
+        if timeout_seconds is not None and not select.select(
+            [file_descriptor], [], [], timeout_seconds
+        )[0]:
+            return None
         character = _read_utf8_character(file_descriptor)
         if character == "\x03":
             raise KeyboardInterrupt
+        if character == "\x04":
+            raise EOFError
         if character == "\x1b":
             sequence = character
             while len(sequence) < 8 and select.select([file_descriptor], [], [], 0.03)[0]:
-                sequence += os.read(file_descriptor, 1).decode("ascii", errors="ignore")
+                next_byte = os.read(file_descriptor, 1)
+                if not next_byte:
+                    raise EOFError
+                sequence += next_byte.decode("ascii", errors="replace")
                 if sequence.endswith(("A", "B", "C", "D", "~")):
                     break
             return {
@@ -2598,9 +2848,8 @@ def list_pending_cleanups_report(
         inspection = None
         inspection_error = None
         try:
-            if not isinstance(repo_value, str) or not isinstance(branch_value, str):
-                raise BootstrapError("invalid pending branch cleanup record")
-            inspection = inspect_branch(Path(repo_value), branch_value)
+            snapshot = _inspect_cleanup(record)
+            inspection = snapshot.branch
         except BootstrapError as exc:
             inspection_error = str(exc)
         pending.append({
@@ -2638,125 +2887,15 @@ def decide_pending_cleanup(
     if not cleanup_id:
         raise BootstrapError("a branch cleanup id is required", code="cleanup_id_required")
     try:
-        path = pending_cleanup_path(state_dir, cleanup_id)
+        pending_cleanup_path(state_dir, cleanup_id)
     except BootstrapError as exc:
         raise BootstrapError("branch cleanup request not found", code="cleanup_not_found") from exc
-    if not path.exists():
-        raise BootstrapError("branch cleanup request not found", code="cleanup_not_found")
-    loaded = _read_json_file(path)
-    if loaded is None:
-        raise BootstrapError("invalid pending branch cleanup record", code="invalid_record")
-    record: Mapping[str, Any] = dict(loaded, _path=os.fspath(path))
-    repo_value = record.get("repo_root")
-    branch_value = record.get("branch")
-    worktree_value = record.get("worktree_path")
-    branch_outcome = record.get("branch_outcome")
-    if (
-        record.get("id") != cleanup_id
-        or not isinstance(repo_value, str) or not repo_value
-        or not isinstance(branch_value, str) or not branch_value
-        or not isinstance(worktree_value, str) or not worktree_value
-        or branch_outcome not in (None, "kept", "deleted_safely", "deleted_forcibly", "already_absent")
-    ):
-        raise BootstrapError("invalid pending branch cleanup record", code="invalid_record")
-    if checkout == "remove" and confirm_checkout != Path(worktree_value).name:
-        raise BootstrapError(
-            f"checkout confirmation must exactly match {Path(worktree_value).name!r}",
-            code="confirmation_mismatch",
-        )
-
-    if branch_outcome is None:
-        try:
-            inspection = inspect_branch(Path(repo_value), branch_value)
-        except BootstrapError as exc:
-            raise BootstrapError(str(exc), code="inspection_failed") from exc
-        if not inspection.exists:
-            branch_outcome = "already_absent"
-        elif decision is None:
-            raise BootstrapError("a branch decision is required", code="decision_required")
-        elif decision == "keep":
-            branch_outcome = "kept"
-        else:
-            if confirm != branch_value:
-                raise BootstrapError(
-                    f"branch confirmation must exactly match {branch_value!r}",
-                    code="confirmation_mismatch",
-                )
-            if inspection.protected:
-                raise BootstrapError(
-                    f"refusing to delete protected branch: {branch_value}", code="branch_protected"
-                )
-            if inspection.used_by_worktrees:
-                raise BootstrapError(
-                    "refusing to delete a branch used by another worktree", code="branch_in_use"
-                )
-            force = decision == "force"
-            try:
-                delete_local_branch(
-                    inspection.repo_root,
-                    inspection.branch,
-                    force=force,
-                    expected_oid=inspection.head_oid,
-                )
-            except BootstrapError as exc:
-                _record_cleanup_result(
-                    state_dir,
-                    record,
-                    "force_delete_failed" if force else "safe_delete_failed",
-                    error=str(exc),
-                )
-                raise BootstrapError(
-                    str(exc), code="force_delete_failed" if force else "safe_delete_refused"
-                ) from exc
-            branch_outcome = "deleted_forcibly" if force else "deleted_safely"
-        record = _update_pending_cleanup_record(
-            state_dir, record, {"branch_outcome": branch_outcome}
-        )
-
-    leftover = inspect_leftover_path(Path(worktree_value))
-    resolved = True
-    needs = None
-    if not leftover.exists:
-        checkout_outcome = "absent"
-        resolution = str(branch_outcome)
-    elif checkout is None:
-        checkout_outcome = None
-        resolved = False
-        needs = "checkout_decision"
-        resolution = str(branch_outcome)
-    elif checkout == "keep":
-        checkout_outcome = "kept"
-        resolution = "kept_with_leftover_files"
-    else:
-        try:
-            remove_leftover_worktree_files(
-                Path(repo_value),
-                Path(worktree_value),
-                worktree_root=load_worktree_directory(effective_env),
-                provenance_verified=bool(record.get("provenance_verified")),
-                expected_device=leftover.device,
-                expected_inode=leftover.inode,
-            )
-        except BootstrapError as exc:
-            _record_cleanup_result(state_dir, record, "checkout_delete_failed", error=str(exc))
-            raise BootstrapError(str(exc), code="checkout_delete_failed") from exc
-        checkout_outcome = "removed"
-        resolution = str(branch_outcome)
-    if resolved:
-        record = _update_pending_cleanup_record(
-            state_dir, record, {"checkout_outcome": checkout_outcome}
-        )
-        _resolve_pending_cleanup(state_dir, record, resolution)
-    return {
-        "ok": True,
-        "id": cleanup_id,
-        "branch": branch_value,
-        "worktree_path": worktree_value,
-        "branch_outcome": branch_outcome,
-        "checkout_outcome": checkout_outcome,
-        "resolved": resolved,
-        "needs": needs,
-    }
+    snapshot = _transition_cleanup(
+        state_dir, cleanup_id, decision=decision, confirm=confirm,
+        checkout=checkout, confirm_checkout=confirm_checkout, env=effective_env,
+    )
+    assert snapshot is not None
+    return _cleanup_report(snapshot)
 
 
 def review_pending_cleanups(
@@ -2770,257 +2909,182 @@ def review_pending_cleanups(
     effective_env = os.environ if env is None else env
     decorated = output_fn is print and sys.stdout.isatty()
     color_enabled = (
-        decorated
-        and "NO_COLOR" not in effective_env
+        decorated and "NO_COLOR" not in effective_env
         and effective_env.get("TERM", "") != "dumb"
     )
     theme_settings = load_theme_settings(effective_env)
     appearance = query_terminal_appearance() if decorated and theme_settings.auto_switch else None
     palette = resolve_theme_palette(theme_settings, appearance=appearance)
     columns = shutil.get_terminal_size((80, 24)).columns
-    records = list_pending_cleanups(state_dir)
-    if cleanup_id:
-        records = [record for record in records if record.get("id") == cleanup_id]
+    cleanup_ids = (
+        [cleanup_id] if cleanup_id else
+        [path.stem for path in sorted(_pending_cleanup_dir(state_dir).glob("*.json"))]
+    )
+    records: List[Mapping[str, Any]] = []
+    invalid_records = False
+    for candidate_id in cleanup_ids:
+        try:
+            with _cleanup_transaction(state_dir, candidate_id):
+                record = _load_pending_cleanup(state_dir, candidate_id)
+        except BootstrapError as exc:
+            output_fn(f"Cannot review cleanup {_safe_terminal_text(candidate_id)}: {_safe_terminal_text(exc)}")
+            invalid_records = True
+            continue
+        if record is not None:
+            records.append(record)
+    records.sort(key=lambda item: str(item["created_at"]))
     if not records:
-        output_fn("No pending branch cleanups.")
+        if not invalid_records:
+            output_fn("No pending branch cleanups.")
         return 0
+    single_key_mode = input_fn is input and sys.stdin.isatty()
+
+    def read_choice(prompt: str) -> Optional[str]:
+        nonlocal single_key_mode
+        if single_key_mode:
+            try:
+                value = read_single_key(timeout_seconds=1.0)
+                return None if value is None else normalize_cleanup_choice(value)
+            except (OSError, ValueError, AttributeError):
+                single_key_mode = False
+        return normalize_cleanup_choice(input_fn(prompt))
+
+    def announce_changes(before: Mapping[str, Any], after: Mapping[str, Any]) -> None:
+        if before.get("branch_outcome") != after.get("branch_outcome"):
+            messages = {
+                "kept": f"Kept local branch {after['branch']}.",
+                "deleted_safely": f"Deleted local branch {after['branch']} safely.",
+                "deleted_forcibly": f"Force-deleted local branch {after['branch']}.",
+                "already_absent": "The local branch no longer exists.",
+            }
+            output_fn(_safe_terminal_text(messages[after["branch_outcome"]]))
+        if before.get("checkout_outcome") != after.get("checkout_outcome"):
+            messages = {
+                "kept": f"Kept leftover files at {after['worktree_path']}.",
+                "removed": f"Removed leftover files at {after['worktree_path']}.",
+                "absent": "The leftover checkout directory no longer exists.",
+            }
+            output_fn(_safe_terminal_text(messages[after["checkout_outcome"]]))
 
     for initial_record in records:
-        record: Mapping[str, Any] = initial_record
-        repo_value = record.get("repo_root")
-        branch_value = record.get("branch")
-        worktree_value = record.get("worktree_path")
-        if (
-            not isinstance(repo_value, str)
-            or not isinstance(branch_value, str)
-            or not isinstance(worktree_value, str)
-        ):
-            output_fn("Skipping an invalid pending branch cleanup record.")
-            continue
-        try:
-            inspection = inspect_branch(Path(repo_value), branch_value)
-        except BootstrapError as exc:
-            output_fn(
-                f"Cannot inspect {_safe_terminal_text(branch_value)}: "
-                f"{_safe_terminal_text(exc)}"
-            )
-            output_fn("The request remains pending for later review.")
-            continue
-        leftover = inspect_leftover_path(Path(worktree_value))
-
-        def display_cleanup(*notices: str) -> None:
-            _clear_screen()
-            for line in render_cleanup_dialog(
-                inspection,
-                record,
-                palette,
-                columns=columns,
-                decorated=decorated,
-                color_enabled=color_enabled,
-                leftover=leftover,
-            ):
-                output_fn(line)
-            for notice in notices:
-                output_fn(notice)
-
-        action_footer_visible = _supports_action_footer(decorated, columns)
-        single_key_mode = action_footer_visible and input_fn is input and sys.stdin.isatty()
-        branch_outcome = record.get("branch_outcome")
-        deferred = False
-        if not isinstance(branch_outcome, str):
-            display_cleanup()
-            if not inspection.exists:
-                branch_outcome = "already_absent"
-                record = _update_pending_cleanup_record(
-                    state_dir,
-                    record,
-                    {"branch_outcome": branch_outcome},
+        snapshot: Optional[CleanupSnapshot] = None
+        displayed: Optional[CleanupSnapshot] = None
+        notice = ""
+        while True:
+            try:
+                refreshed = _transition_cleanup(
+                    state_dir, initial_record["id"], env=effective_env,
+                    expected=snapshot, reconcile_only=True, missing_ok=True,
                 )
-                output_fn("The local branch no longer exists.")
+            except BootstrapError as exc:
+                output_fn(f"Cannot review cleanup: {_safe_terminal_text(exc)}")
+                output_fn("The request remains available for fresh review if still pending.")
+                break
+            if refreshed is None:
+                output_fn("This cleanup request has already been handled.")
+                break
+            previous = snapshot.record if snapshot is not None else initial_record
+            announce_changes(previous, refreshed.record)
+            snapshot = refreshed
+            if snapshot.resolved:
+                break
+            branch_pending = snapshot.record.get("branch_outcome") is None
+            if branch_pending:
+                blocked = snapshot.branch.protected or snapshot.branch.used_by_worktrees
+                prompt = (
+                    "[K]eep branch (default)  [S]kip for later  [Q]uit: " if blocked else
+                    "[K]eep (default)  [D]elete safely  [F]orce delete...  [S]kip  [Q]uit: "
+                )
             else:
-                while True:
-                    if inspection.protected or inspection.used_by_worktrees:
-                        prompt = "[K]eep branch (default)  [S]kip for later  [Q]uit: "
-                    else:
-                        prompt = "[K]eep (default)  [D]elete safely  [F]orce delete...  [S]kip  [Q]uit: "
-                    if action_footer_visible and not single_key_mode:
-                        prompt = _style_text(
-                            "Select › ",
-                            palette,
-                            "accent",
-                            enabled=color_enabled,
-                            bold=True,
-                        )
-                    try:
-                        if single_key_mode:
-                            try:
-                                choice = normalize_cleanup_choice(read_single_key())
-                            except (OSError, ValueError, AttributeError):
-                                single_key_mode = False
-                                choice = normalize_cleanup_choice(input_fn(prompt))
-                        else:
-                            choice = normalize_cleanup_choice(input_fn(prompt))
-                    except EOFError:
-                        output_fn("No interactive input; request remains pending.")
-                        return 0
+                prompt = "[K]eep files (default)  [R]emove files...  [S]kip  [Q]uit: "
+            if snapshot != displayed or notice:
+                if decorated:
+                    _clear_screen()
+                for line in render_cleanup_dialog(
+                    snapshot.branch, snapshot.record, palette, columns=columns,
+                    decorated=decorated, color_enabled=color_enabled,
+                    leftover=snapshot.leftover,
+                ):
+                    output_fn(line)
+                if not branch_pending:
+                    output_fn("Review the leftover checkout directory separately from the branch.")
+                if single_key_mode:
+                    output_fn("Waiting for a choice; external changes are checked every second.")
+                    if not _supports_action_footer(decorated, columns):
+                        output_fn(prompt)
+                if notice:
+                    output_fn(notice)
+                    notice = ""
+                displayed = snapshot
+            try:
+                choice = read_choice(prompt)
+                if choice is None:
+                    continue
+                if choice in ("q", "quit"):
+                    return 0
+                if choice in ("s", "skip"):
+                    output_fn("Request left pending for later review.")
+                    break
+                decision = checkout = confirm = confirm_checkout = None
+                if branch_pending:
                     if choice in ("", "k", "keep"):
-                        branch_outcome = "kept"
-                        record = _update_pending_cleanup_record(
-                            state_dir, record, {"branch_outcome": branch_outcome}
-                        )
-                        output_fn(f"Kept local branch {inspection.branch}.")
-                        break
-                    if choice in ("s", "skip"):
-                        output_fn("Request left pending for later review.")
-                        deferred = True
-                        break
-                    if choice in ("q", "quit"):
-                        return 0
-                    if (
-                        choice in ("d", "delete")
-                        and not inspection.protected
-                        and not inspection.used_by_worktrees
-                    ):
-                        try:
-                            delete_local_branch(
-                                inspection.repo_root,
-                                inspection.branch,
-                                force=False,
-                                expected_oid=inspection.head_oid,
-                            )
-                        except BootstrapError as exc:
-                            _record_cleanup_result(
-                                state_dir, record, "safe_delete_failed", error=str(exc)
-                            )
-                            inspection = inspect_branch(inspection.repo_root, inspection.branch)
-                            display_cleanup(
-                                f"Safe deletion refused: {_safe_terminal_text(exc)}",
-                                "The request remains pending. Use force only after reviewing unmerged commits.",
-                            )
-                            continue
-                        branch_outcome = "deleted_safely"
-                        record = _update_pending_cleanup_record(
-                            state_dir, record, {"branch_outcome": branch_outcome}
-                        )
-                        output_fn(f"Deleted local branch {inspection.branch} safely.")
-                        break
-                    if (
-                        choice in ("f", "force")
-                        and not inspection.protected
-                        and not inspection.used_by_worktrees
-                    ):
-                        _clear_screen()
+                        decision = "keep"
+                    elif choice in ("d", "delete") and not blocked:
+                        decision, confirm = "delete", snapshot.branch.branch
+                    elif choice in ("f", "force") and not blocked:
+                        if decorated:
+                            _clear_screen()
                         for line in render_force_delete_dialog(
-                            inspection,
-                            palette,
-                            columns=columns,
-                            decorated=decorated,
-                            color_enabled=color_enabled,
+                            snapshot.branch, palette, columns=columns,
+                            decorated=decorated, color_enabled=color_enabled,
                         ):
                             output_fn(line)
-                        confirmation_prompt = f"Type '{inspection.branch}' to force-delete: "
-                        if decorated:
-                            confirmation_prompt = _style_text(
-                                "Branch name › ",
-                                palette,
-                                "danger",
-                                enabled=color_enabled,
-                                bold=True,
-                            )
-                        try:
-                            confirmation = input_fn(confirmation_prompt).strip()
-                        except EOFError:
-                            output_fn("No confirmation; request remains pending.")
-                            return 0
-                        if confirmation != inspection.branch:
-                            display_cleanup("Branch name did not match; nothing was deleted.")
+                        # Deliberately blocking: do not refresh a partially typed approval.
+                        confirm = input_fn(
+                            f"Type '{snapshot.branch.branch}' to force-delete: "
+                        ).strip()
+                        if confirm != snapshot.branch.branch:
+                            notice = "Branch name did not match; nothing was deleted."
                             continue
-                        try:
-                            delete_local_branch(
-                                inspection.repo_root,
-                                inspection.branch,
-                                force=True,
-                                expected_oid=inspection.head_oid,
-                            )
-                        except BootstrapError as exc:
-                            _record_cleanup_result(
-                                state_dir, record, "force_delete_failed", error=str(exc)
-                            )
-                            inspection = inspect_branch(inspection.repo_root, inspection.branch)
-                            display_cleanup(f"Force deletion failed: {_safe_terminal_text(exc)}")
-                            continue
-                        branch_outcome = "deleted_forcibly"
-                        record = _update_pending_cleanup_record(
-                            state_dir, record, {"branch_outcome": branch_outcome}
-                        )
-                        output_fn(f"Force-deleted local branch {inspection.branch}.")
-                        break
-                    if single_key_mode:
-                        sys.stdout.write("\a")
-                        sys.stdout.flush()
+                        decision = "force"
                     else:
-                        output_fn("Unknown or unavailable choice.")
-        if deferred:
-            continue
-
-        leftover = inspect_leftover_path(Path(worktree_value))
-        if not leftover.exists:
-            record = _update_pending_cleanup_record(
-                state_dir, record, {"checkout_outcome": "absent"}
-            )
-            _resolve_pending_cleanup(state_dir, record, str(branch_outcome))
-            continue
-
-        display_cleanup("Review the leftover checkout directory separately from the branch.")
-        while True:
-            prompt = "[K]eep files (default)  [R]emove files...  [S]kip  [Q]uit: "
-            try:
-                choice = normalize_cleanup_choice(input_fn(prompt))
+                        notice = "Unknown or unavailable choice."
+                        continue
+                elif choice in ("", "k", "keep"):
+                    checkout = "keep"
+                elif choice in ("r", "remove"):
+                    confirm_checkout = input_fn(
+                        f"Type '{snapshot.leftover.path.name}' to remove the leftover directory: "
+                    ).strip()
+                    if confirm_checkout != snapshot.leftover.path.name:
+                        notice = "Directory name did not match; nothing was removed."
+                        continue
+                    checkout = "remove"
+                else:
+                    notice = "Unknown or unavailable choice."
+                    continue
+                applied = _transition_cleanup(
+                    state_dir, initial_record["id"], decision=decision, confirm=confirm,
+                    checkout=checkout, confirm_checkout=confirm_checkout,
+                    env=effective_env, expected=snapshot, missing_ok=True,
+                )
             except EOFError:
-                output_fn("No interactive input; request remains pending.")
+                output_fn("No interactive input; request remains pending if still present.")
                 return 0
-            if choice in ("", "k", "keep"):
-                record = _update_pending_cleanup_record(
-                    state_dir, record, {"checkout_outcome": "kept"}
-                )
-                _resolve_pending_cleanup(state_dir, record, "kept_with_leftover_files")
-                output_fn(f"Kept leftover files at {worktree_value}.")
+            except BootstrapError as exc:
+                if exc.code == "invalid_record":
+                    output_fn(f"Fresh review required: {_safe_terminal_text(exc)}")
+                    break
+                notice = f"Cleanup action refused: {_safe_terminal_text(exc)}"
+                displayed = None
+                continue
+            if applied is None:
+                output_fn("This cleanup request has already been handled.")
                 break
-            if choice in ("s", "skip"):
-                output_fn("Leftover files remain pending for later review.")
+            announce_changes(snapshot.record, applied.record)
+            snapshot = applied
+            if snapshot.resolved:
                 break
-            if choice in ("q", "quit"):
-                return 0
-            if choice in ("r", "remove"):
-                confirmation = input_fn(
-                    f"Type '{Path(worktree_value).name}' to remove the leftover directory: "
-                ).strip()
-                if confirmation != Path(worktree_value).name:
-                    output_fn("Directory name did not match; nothing was removed.")
-                    continue
-                try:
-                    remove_leftover_worktree_files(
-                        Path(repo_value),
-                        Path(worktree_value),
-                        worktree_root=load_worktree_directory(effective_env),
-                        provenance_verified=bool(record.get("provenance_verified")),
-                        expected_device=leftover.device,
-                        expected_inode=leftover.inode,
-                    )
-                except BootstrapError as exc:
-                    _record_cleanup_result(
-                        state_dir, record, "checkout_delete_failed", error=str(exc)
-                    )
-                    output_fn(f"Leftover deletion failed: {_safe_terminal_text(exc)}")
-                    leftover = inspect_leftover_path(Path(worktree_value))
-                    continue
-                record = _update_pending_cleanup_record(
-                    state_dir, record, {"checkout_outcome": "removed"}
-                )
-                _resolve_pending_cleanup(state_dir, record, str(branch_outcome))
-                output_fn(f"Removed leftover files at {worktree_value}.")
-                break
-            output_fn("Unknown choice.")
     return 0
 
 
@@ -5600,34 +5664,64 @@ def manage_worktree_inventory(
                 for item in items
                 if item.status == "residue" and item.provenance_verified
             ]
-            selected = _choose_inventory_item(candidates, input_fn, output_fn)
-            if selected is None:
-                output_fn("No valid leftover directory was selected.")
-                continue
-            confirmation = input_fn(
-                f"Type '{selected.worktree_path.name}' to remove leftover files: "
-            ).strip()
-            if confirmation != selected.worktree_path.name:
-                output_fn("Confirmation did not match; nothing was removed.")
-                continue
             try:
-                remove_leftover_worktree_files(
-                    selected.repo_root,
-                    selected.worktree_path,
-                    worktree_root=worktree_root,
-                    provenance_verified=selected.provenance_verified,
-                    expected_device=selected.leftover.device,
-                    expected_inode=selected.leftover.inode,
+                selected = _choose_inventory_item(candidates, input_fn, output_fn)
+                if selected is None:
+                    output_fn("No valid leftover directory was selected.")
+                    continue
+                pending_id = (
+                    pending_cleanup_id(selected.repo_root, selected.worktree_path, selected.branch)
+                    if selected.branch else None
                 )
+                pending = (
+                    _load_pending_cleanup(state_dir, pending_id) if pending_id else None
+                )
+                approved = (
+                    dataclasses.replace(_inspect_cleanup(pending), leftover=selected.leftover)
+                    if pending is not None else None
+                )
+                confirmation = input_fn(
+                    f"Type '{selected.worktree_path.name}' to remove leftover files: "
+                ).strip()
+                if confirmation != selected.worktree_path.name:
+                    output_fn("Confirmation did not match; nothing was removed.")
+                    continue
+                if approved is not None:
+                    changed = _transition_cleanup(
+                        state_dir, pending_id, env=effective_env, expected=approved,
+                        checkout="remove", confirm_checkout=confirmation,
+                        checkout_only=True, missing_ok=True,
+                    )
+                    if changed is None or changed.record.get("checkout_outcome") not in (
+                        "removed", "absent"
+                    ):
+                        output_fn("Cleanup changed elsewhere; rescan before another decision.")
+                        continue
+                    outcome = changed.record["checkout_outcome"]
+                else:
+                    outcome = remove_leftover_worktree_files(
+                        selected.repo_root,
+                        selected.worktree_path,
+                        worktree_root=worktree_root,
+                        provenance_verified=selected.provenance_verified,
+                        expected_device=selected.leftover.device,
+                        expected_inode=selected.leftover.inode,
+                    )
                 _update_worktree_mapping(
                     state_dir,
                     selected.worktree_path,
                     {
-                        "checkout_cleanup_status": "removed",
+                        "checkout_cleanup_status": outcome,
                         "checkout_cleanup_at": dt.datetime.now(dt.timezone.utc).isoformat(),
                     },
                 )
-                output_fn("Leftover worktree files removed.")
+                output_fn(
+                    "Leftover worktree files removed." if outcome == "removed"
+                    else "The leftover checkout directory no longer exists."
+                )
+            except EOFError:
+                output_fn("No confirmation; leftover files remain unchanged.")
+                return 0
             except BootstrapError as exc:
                 output_fn(f"Cleanup failed: {exc}")
             continue

@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import pty
@@ -32,6 +33,65 @@ def run(command, *, cwd=None, check=True):
         stderr=subprocess.PIPE,
         text=True,
     )
+
+
+def cleanup_decision_worker(connection, state_dir, cleanup_id, env, *, holder, checkout):
+    """Spawn-safe worker; barriers surround real Git/filesystem mutations."""
+    state_dir = Path(state_dir)
+    original_git = plugin._run_git
+    original_flock = plugin.fcntl.flock
+    original_remove = plugin.remove_leftover_worktree_files
+
+    def mutation_barrier(message):
+        connection.send(message)
+        if not connection.poll(20) or connection.recv() != "continue":
+            raise RuntimeError("cleanup mutation barrier was not released")
+
+    def held_git(repo, arguments, **kwargs):
+        if arguments[:2] == ["branch", "-d"]:
+            mutation_barrier("git-mutation")
+        return original_git(repo, arguments, **kwargs)
+
+    def contended_flock(fd, operation):
+        if operation == plugin.fcntl.LOCK_EX:
+            # Probe the real OS lock, so the parent cannot release the holder
+            # before the second process actually encounters contention.
+            try:
+                original_flock(fd, operation | plugin.fcntl.LOCK_NB)
+            except BlockingIOError:
+                connection.send("contended")
+            else:
+                connection.send("uncontended")
+                return
+        return original_flock(fd, operation)
+
+    def held_remove(*args, **kwargs):
+        mutation_barrier("checkout-mutation")
+        return original_remove(*args, **kwargs)
+
+    try:
+        with contextlib.ExitStack() as stack:
+            if holder:
+                stack.enter_context(mock.patch.object(plugin, "_run_git", side_effect=held_git))
+                arguments = {"decision": "delete", "confirm": "feature"}
+            else:
+                stack.enter_context(
+                    mock.patch.object(plugin.fcntl, "flock", side_effect=contended_flock)
+                )
+                arguments = {"decision": "keep"}
+                if checkout:
+                    stack.enter_context(mock.patch.object(
+                        plugin, "remove_leftover_worktree_files", side_effect=held_remove
+                    ))
+                    arguments = {"checkout": "remove", "confirm_checkout": "feature checkout"}
+            result = plugin.decide_pending_cleanup(
+                state_dir, cleanup_id=cleanup_id, env=env, **arguments
+            )
+            connection.send(("result", result))
+    except plugin.BootstrapError as exc:
+        connection.send(("error", exc.code))
+    finally:
+        connection.close()
 
 
 class PathValidationTests(unittest.TestCase):
@@ -403,6 +463,42 @@ accent = "cyan"
                     )
                 finally:
                     writer.join()
+                    os.close(master)
+                    os.close(slave)
+
+    def test_single_key_timeout_enter_and_eof_are_distinct_and_restore_terminal(self):
+        for event in ("timeout", "enter", "eof", "error"):
+            with self.subTest(event=event):
+                master, slave = pty.openpty()
+                output = io.StringIO()
+                original = plugin.termios.tcgetattr(slave)
+                try:
+                    if event == "enter":
+                        os.write(master, b"\n")
+                    with contextlib.ExitStack() as stack:
+                        if event == "eof":
+                            stack.enter_context(mock.patch.object(plugin.os, "read", return_value=b""))
+                        elif event == "error":
+                            stack.enter_context(mock.patch.object(
+                                plugin.os, "read", side_effect=OSError("fixture read failure")
+                            ))
+                        if event in ("eof", "error"):
+                            stack.enter_context(mock.patch.object(
+                                plugin.select, "select", return_value=([slave], [], [])
+                            ))
+                            with self.assertRaises(EOFError if event == "eof" else OSError):
+                                plugin.read_single_key(
+                                    input_fd=slave, output_stream=output, timeout_seconds=0
+                                )
+                        else:
+                            value = plugin.read_single_key(
+                                input_fd=slave, output_stream=output,
+                                timeout_seconds=1 if event == "enter" else 0,
+                            )
+                            self.assertEqual(value, "" if event == "enter" else None)
+                    self.assertEqual(plugin.termios.tcgetattr(slave), original)
+                    self.assertTrue(output.getvalue().endswith("\033[?25h"))
+                finally:
                     os.close(master)
                     os.close(slave)
 
@@ -1483,8 +1579,7 @@ class BranchCleanupTests(GitRepositoryTestCase):
             output_fn=output.append,
         )
         self.assertFalse(self.branch_exists("feature"))
-        self.assertTrue(any("Safe deletion refused" in line for line in output))
-        self.assertTrue(any("did not match" in line for line in output))
+        self.assertEqual(plugin.list_pending_cleanups(self.state_dir), [])
         last = plugin._read_json_file(
             self.state_dir / plugin.BRANCH_CLEANUP_DIR / "last-result.json"
         )
@@ -1513,7 +1608,6 @@ class BranchCleanupTests(GitRepositoryTestCase):
             output_fn=output.append,
         )
         self.assertTrue(self.branch_exists(primary_branch))
-        self.assertTrue(any("Deletion blocked" in line for line in output))
         with self.assertRaisesRegex(plugin.BootstrapError, "protected"):
             plugin.delete_local_branch(self.source, primary_branch, force=True)
 
@@ -2158,6 +2252,597 @@ class HeadlessCliTests(GitRepositoryTestCase):
         self.assertTrue(document["resolved"])
         self.assertEqual(document["id"], pending["id"])
         self.assertFalse(plugin.pending_cleanup_path(self.state_dir, pending["id"]).exists())
+
+    def review_cleanup(self, pending, input_fn):
+        return plugin.review_pending_cleanups(
+            self.state_dir, cleanup_id=pending["id"], input_fn=input_fn,
+            output_fn=lambda line: None, env=self.env,
+        )
+
+    def saved_pending(self, pending):
+        return json.loads(
+            plugin.pending_cleanup_path(self.state_dir, pending["id"]).read_text(encoding="utf-8")
+        )
+
+    def receive_cleanup_worker(self, connection):
+        self.assertTrue(connection.poll(15), "cleanup worker did not reach its barrier")
+        return connection.recv()
+
+    @contextlib.contextmanager
+    def contending_cleanup_workers(self, pending, *, checkout=False):
+        context = multiprocessing.get_context("spawn")
+        children = []
+        connections = []
+
+        def start(holder):
+            parent, child = context.Pipe()
+            connections.extend((parent, child))
+            process = context.Process(
+                target=cleanup_decision_worker,
+                args=(child, os.fspath(self.state_dir), pending["id"], self.env),
+                kwargs={"holder": holder, "checkout": checkout},
+            )
+            process.start()
+            children.append(process)
+            child.close()
+            return parent
+
+        try:
+            holder = start(True)
+            self.assertEqual(self.receive_cleanup_worker(holder), "git-mutation")
+            contender = start(False)
+            self.assertEqual(self.receive_cleanup_worker(contender), "contended")
+            yield holder, contender
+            for process in children:
+                process.join(15)
+                self.assertEqual(process.exitcode, 0, "cleanup worker did not exit successfully")
+        finally:
+            for connection in connections:
+                connection.close()
+            for process in children:
+                if process.is_alive():
+                    process.terminate()
+                process.join(5)
+                if process.is_alive():
+                    process.kill()
+                    process.join(5)
+                process.close()
+
+    def test_branch_helper_reports_actual_safe_force_and_absent_outcomes(self):
+        self.record_and_remove_target()
+        oid = run(["git", "rev-parse", "feature"], cwd=self.source).stdout.strip()
+        for force, outcome in ((False, "deleted_safely"), (True, "deleted_forcibly")):
+            with self.subTest(force=force):
+                if not self.branch_exists("feature"):
+                    run(["git", "branch", "feature", oid], cwd=self.source)
+                self.assertEqual(
+                    plugin.delete_local_branch(self.source, "feature", force=force), outcome
+                )
+                self.assertFalse(self.branch_exists("feature"))
+                self.assertEqual(
+                    plugin.delete_local_branch(self.source, "feature", force=force),
+                    "already_absent",
+                )
+
+    def test_cli_and_ui_helper_races_preserve_truthful_absence(self):
+        pending = self.queue_removed_target()
+        oid = run(["git", "rev-parse", "feature"], cwd=self.source).stdout.strip()
+        original = plugin.delete_local_branch
+
+        def remove_before_helper(*args, **kwargs):
+            run(["git", "branch", "-D", "feature"], cwd=self.source)
+            return original(*args, **kwargs)
+
+        for adapter in ("cli", "ui"):
+            for force in (False, True):
+                with self.subTest(adapter=adapter, force=force):
+                    if not self.branch_exists("feature"):
+                        run(["git", "branch", "feature", oid], cwd=self.source)
+                        pending = plugin.queue_branch_cleanup(self.removed_event(), self.state_dir)
+                    with mock.patch.object(plugin, "delete_local_branch", side_effect=remove_before_helper):
+                        if adapter == "cli":
+                            status, document, _ = self.invoke_json(self.cleanup_arguments(
+                                pending, "--decision", "force" if force else "delete",
+                                "--confirm", "feature",
+                            ))
+                            self.assertEqual(status, 0)
+                            self.assertEqual(document["branch_outcome"], "already_absent")
+                        else:
+                            answers = iter(["f", "feature"] if force else ["d"])
+                            self.assertEqual(
+                                self.review_cleanup(pending, lambda prompt: next(answers)), 0
+                            )
+                    self.assertFalse(self.branch_exists("feature"))
+                    self.assertFalse(plugin.pending_cleanup_path(self.state_dir, pending["id"]).exists())
+                    self.assertEqual(self.last_cleanup_result()["branch_outcome"], "already_absent")
+                    self.assertEqual(self.last_cleanup_result()["outcome"], "already_absent")
+
+    def test_git_command_deletion_race_is_absent_not_a_plugin_deletion(self):
+        pending = self.queue_removed_target()
+        oid = run(["git", "rev-parse", "feature"], cwd=self.source).stdout.strip()
+        original = plugin._run_git
+
+        def race_at_git(repo, arguments, **kwargs):
+            if arguments[:2] in (["branch", "-d"], ["branch", "-D"]):
+                run(["git", "branch", "-D", "feature"], cwd=self.source)
+            return original(repo, arguments, **kwargs)
+
+        for adapter in ("cli", "ui"):
+            for force in (False, True):
+                with self.subTest(adapter=adapter, force=force):
+                    if not self.branch_exists("feature"):
+                        run(["git", "branch", "feature", oid], cwd=self.source)
+                        pending = plugin.queue_branch_cleanup(self.removed_event(), self.state_dir)
+                    with mock.patch.object(plugin, "_run_git", side_effect=race_at_git):
+                        if adapter == "cli":
+                            status, document, _ = self.invoke_json(self.cleanup_arguments(
+                                pending, "--decision", "force" if force else "delete",
+                                "--confirm", "feature",
+                            ))
+                            self.assertEqual(status, 0)
+                            self.assertEqual(document["branch_outcome"], "already_absent")
+                        else:
+                            answers = iter(["f", "feature"] if force else ["d"])
+                            self.review_cleanup(pending, lambda prompt: next(answers))
+                    self.assertEqual(self.last_cleanup_result()["branch_outcome"], "already_absent")
+                    self.assertEqual(self.last_cleanup_result()["outcome"], "already_absent")
+                    self.assertFalse(self.branch_exists("feature"))
+                    self.assertFalse(plugin.pending_cleanup_path(self.state_dir, pending["id"]).exists())
+
+    def test_real_git_failure_keeps_branch_and_pending_for_both_adapters(self):
+        pending = self.queue_removed_target()
+        ref_lock = self.source / ".git" / "refs" / "heads" / "feature.lock"
+        ref_lock.write_text("fixture lock\n", encoding="utf-8")
+        for adapter in ("cli", "ui"):
+            for force in (False, True):
+                with self.subTest(adapter=adapter, force=force):
+                    if adapter == "cli":
+                        self.assert_cli_error(
+                            self.cleanup_arguments(
+                                pending, "--decision", "force" if force else "delete",
+                                "--confirm", "feature",
+                            ),
+                            "force_delete_failed" if force else "safe_delete_refused",
+                        )
+                    else:
+                        answers = iter(["f", "feature", "q"] if force else ["d", "q"])
+                        self.review_cleanup(pending, lambda prompt: next(answers))
+                    self.assertTrue(self.branch_exists("feature"))
+                    self.assertIsNone(self.saved_pending(pending).get("branch_outcome"))
+                    self.assertEqual(
+                        self.last_cleanup_result()["outcome"],
+                        "force_delete_failed" if force else "safe_delete_failed",
+                    )
+        self.assertEqual(ref_lock.read_text(encoding="utf-8"), "fixture lock\n")
+
+    def test_ui_rechecks_the_displayed_oid_before_safe_or_force_deletion(self):
+        pending = self.queue_removed_target()
+        tree = run(["git", "rev-parse", "HEAD^{tree}"], cwd=self.source).stdout.strip()
+        advanced = run(
+            ["git", "commit-tree", tree, "-p", "HEAD", "-m", "new feature tip"],
+            cwd=self.source,
+        ).stdout.strip()
+        original_oid = run(["git", "rev-parse", "feature"], cwd=self.source).stdout.strip()
+        for force in (False, True):
+            with self.subTest(force=force):
+                run(["git", "update-ref", "refs/heads/feature", original_oid], cwd=self.source)
+                answers = iter(["f", "feature", "q"] if force else ["d", "q"])
+
+                def answer(prompt):
+                    value = next(answers)
+                    if value == ("feature" if force else "d"):
+                        run(["git", "update-ref", "refs/heads/feature", advanced], cwd=self.source)
+                    return value
+
+                self.review_cleanup(pending, answer)
+                self.assertEqual(
+                    run(["git", "rev-parse", "feature"], cwd=self.source).stdout.strip(),
+                    advanced,
+                )
+                self.assertIsNone(self.saved_pending(pending).get("branch_outcome"))
+
+    def test_ui_rechecks_real_directory_inode_after_typed_confirmation(self):
+        pending = self.queue_removed_target(leftover=True)
+        old = self.root / "original residue"
+        old_inode = self.target.stat().st_ino
+        answers = iter(["k", "r", self.target.name, "q"])
+
+        def answer(prompt):
+            value = next(answers)
+            if value == self.target.name:
+                self.target.rename(old)
+                self.target.mkdir()
+                (self.target / "replacement").write_text("must survive", encoding="utf-8")
+                self.assertNotEqual(self.target.stat().st_ino, old_inode)
+            return value
+
+        self.review_cleanup(pending, answer)
+        self.assertEqual((self.target / "replacement").read_text(encoding="utf-8"), "must survive")
+        self.assertTrue((old / "ios" / "cache").exists())
+        self.assertEqual(self.saved_pending(pending)["branch_outcome"], "kept")
+        self.assertIsNone(self.saved_pending(pending).get("checkout_outcome"))
+
+    def test_cli_checkout_inode_race_preserves_saved_branch_progress(self):
+        pending = self.queue_removed_target(leftover=True)
+        original = plugin.remove_leftover_worktree_files
+        old = self.root / "original residue"
+
+        def replace_before_remove(*args, **kwargs):
+            self.target.rename(old)
+            self.target.mkdir()
+            (self.target / "replacement").write_text("must survive", encoding="utf-8")
+            return original(*args, **kwargs)
+
+        with mock.patch.object(
+            plugin, "remove_leftover_worktree_files", side_effect=replace_before_remove
+        ):
+            self.assert_cli_error(self.cleanup_arguments(
+                pending, "--decision", "delete", "--confirm", "feature",
+                "--checkout", "remove", "--confirm-checkout", self.target.name,
+            ), "checkout_delete_failed")
+        self.assertFalse(self.branch_exists("feature"))
+        self.assertTrue((self.target / "replacement").exists())
+        self.assertTrue((old / "ios" / "cache").exists())
+        self.assertEqual(self.saved_pending(pending)["branch_outcome"], "deleted_safely")
+        self.assertIsNone(self.saved_pending(pending).get("checkout_outcome"))
+
+    def test_selected_invalid_or_unreadable_cleanup_reports_refusal_without_mutation(self):
+        pending = self.queue_removed_target()
+        path = plugin.pending_cleanup_path(self.state_dir, pending["id"])
+        original = path.read_text(encoding="utf-8")
+        without_id = dict(pending)
+        without_id.pop("id")
+        original_read = Path.read_text
+
+        def unreadable(selected, *args, **kwargs):
+            if selected == path:
+                raise PermissionError("fixture pending record is unreadable")
+            return original_read(selected, *args, **kwargs)
+
+        for reason, contents in (
+            ("malformed-json", "{"),
+            ("missing-id", json.dumps(without_id)),
+            ("unreadable", original),
+        ):
+            with self.subTest(reason=reason):
+                path.write_text(contents, encoding="utf-8")
+                messages = []
+                patch = (
+                    mock.patch.object(Path, "read_text", new=unreadable)
+                    if reason == "unreadable" else contextlib.nullcontext()
+                )
+                with patch:
+                    self.assertEqual(plugin.review_pending_cleanups(
+                        self.state_dir, cleanup_id=pending["id"],
+                        input_fn=mock.Mock(side_effect=AssertionError("invalid request prompted")),
+                        output_fn=messages.append, env=self.env,
+                    ), 0)
+                    self.assert_cli_error(
+                        self.cleanup_arguments(pending, "--decision", "keep"), "invalid_record"
+                    )
+                self.assertTrue(messages, "invalid selected request was silently ignored")
+                self.assertTrue(all(pending["id"] in message for message in messages))
+                self.assertEqual(path.read_text(encoding="utf-8"), contents)
+                self.assertTrue(self.branch_exists("feature"))
+                self.assertFalse(self.target.exists())
+                self.assertFalse(
+                    (self.state_dir / plugin.BRANCH_CLEANUP_DIR / "last-result.json").exists()
+                )
+
+    def test_review_all_reports_invalid_requests_and_completes_valid_request(self):
+        pending = self.queue_removed_target()
+        without_id = dict(pending)
+        without_id.pop("id")
+        invalid = {
+            "a" * 24: "{",
+            "b" * 24: json.dumps(without_id),
+        }
+        for cleanup_id, contents in invalid.items():
+            plugin.pending_cleanup_path(self.state_dir, cleanup_id).write_text(
+                contents, encoding="utf-8"
+            )
+        answers = iter(["k"])
+        messages = []
+        self.assertEqual(plugin.review_pending_cleanups(
+            self.state_dir, input_fn=lambda prompt: next(answers),
+            output_fn=messages.append, env=self.env,
+        ), 0)
+        for cleanup_id, contents in invalid.items():
+            self.assertTrue(any(cleanup_id in message for message in messages))
+            self.assertEqual(
+                plugin.pending_cleanup_path(self.state_dir, cleanup_id).read_text(encoding="utf-8"),
+                contents,
+            )
+        self.assertFalse(plugin.pending_cleanup_path(self.state_dir, pending["id"]).exists())
+        self.assertTrue(self.branch_exists("feature"))
+        self.assertFalse(self.target.exists())
+        final = self.last_cleanup_result()
+        self.assertEqual(final["branch_outcome"], "kept")
+        self.assertEqual(final["checkout_outcome"], "absent")
+        self.assertEqual(final["outcome"], "kept")
+
+    def test_same_id_process_decisions_cannot_resurrect_or_overwrite_winner(self):
+        pending = self.queue_removed_target()
+        with self.contending_cleanup_workers(pending) as (holder, contender):
+            self.assertTrue(self.branch_exists("feature"))
+            self.assertTrue(plugin.pending_cleanup_path(self.state_dir, pending["id"]).exists())
+            holder.send("continue")
+            kind, winner = self.receive_cleanup_worker(holder)
+            self.assertEqual(kind, "result")
+            self.assertTrue(winner["resolved"])
+            self.assertEqual(winner["branch_outcome"], "deleted_safely")
+            self.assertEqual(winner["checkout_outcome"], "absent")
+            self.assertEqual(
+                self.receive_cleanup_worker(contender), ("error", "cleanup_not_found")
+            )
+        self.assertFalse(self.branch_exists("feature"))
+        self.assertFalse(self.target.exists())
+        self.assertFalse(plugin.pending_cleanup_path(self.state_dir, pending["id"]).exists())
+        final = self.last_cleanup_result()
+        self.assertEqual(final["branch_outcome"], "deleted_safely")
+        self.assertEqual(final["checkout_outcome"], "absent")
+        self.assertEqual(final["outcome"], "deleted_safely")
+
+    def test_same_id_process_checkout_completion_preserves_saved_branch_progress(self):
+        pending = self.queue_removed_target(leftover=True)
+        with self.contending_cleanup_workers(pending, checkout=True) as (holder, contender):
+            holder.send("continue")
+            kind, partial = self.receive_cleanup_worker(holder)
+            self.assertEqual(kind, "result")
+            self.assertFalse(partial["resolved"])
+            self.assertEqual(partial["branch_outcome"], "deleted_safely")
+            self.assertEqual(self.receive_cleanup_worker(contender), "checkout-mutation")
+            self.assertFalse(self.branch_exists("feature"))
+            self.assertEqual(
+                (self.target / "ios" / "cache").read_text(encoding="utf-8"), "generated"
+            )
+            saved = self.saved_pending(pending)
+            self.assertEqual(saved["branch_outcome"], "deleted_safely")
+            self.assertIsNone(saved.get("checkout_outcome"))
+            contender.send("continue")
+            kind, completed = self.receive_cleanup_worker(contender)
+            self.assertEqual(kind, "result")
+            self.assertTrue(completed["resolved"])
+            self.assertEqual(completed["branch_outcome"], "deleted_safely")
+            self.assertEqual(completed["checkout_outcome"], "removed")
+        self.assertFalse(self.branch_exists("feature"))
+        self.assertFalse(self.target.exists())
+        self.assertFalse(plugin.pending_cleanup_path(self.state_dir, pending["id"]).exists())
+        final = self.last_cleanup_result()
+        self.assertEqual(final["branch_outcome"], "deleted_safely")
+        self.assertEqual(final["checkout_outcome"], "removed")
+        self.assertEqual(final["outcome"], "deleted_safely")
+
+    def test_concurrent_resolution_during_ui_input_never_resurrects_request(self):
+        pending = self.queue_removed_target()
+        winner = []
+
+        def answer(prompt):
+            result = plugin.decide_pending_cleanup(
+                self.state_dir, cleanup_id=pending["id"], decision="keep", env=self.env
+            )
+            self.assertTrue(result["resolved"])
+            winner.append(self.last_cleanup_result())
+            return "d"
+
+        self.assertEqual(self.review_cleanup(pending, answer), 0)
+        self.assertTrue(self.branch_exists("feature"))
+        self.assertEqual(self.last_cleanup_result(), winner[0])
+        self.assertFalse(plugin.pending_cleanup_path(self.state_dir, pending["id"]).exists())
+
+    def test_concurrent_partial_branch_decision_refreshes_before_checkout_choice(self):
+        pending = self.queue_removed_target(leftover=True)
+        answers = iter(["d", "r", self.target.name])
+
+        def answer(prompt):
+            value = next(answers)
+            if value == "d":
+                result = plugin.decide_pending_cleanup(
+                    self.state_dir, cleanup_id=pending["id"], decision="keep", env=self.env
+                )
+                self.assertFalse(result["resolved"])
+                self.assertEqual(result["branch_outcome"], "kept")
+            return value
+
+        self.review_cleanup(pending, answer)
+        self.assertTrue(self.branch_exists("feature"))
+        self.assertFalse(self.target.exists())
+        self.assertEqual(self.last_cleanup_result()["branch_outcome"], "kept")
+        self.assertEqual(self.last_cleanup_result()["checkout_outcome"], "removed")
+        self.assertEqual(plugin.list_pending_cleanups(self.state_dir), [])
+
+    def test_duplicate_queue_preserves_generation_and_partial_progress(self):
+        pending = self.queue_removed_target(leftover=True)
+        result = plugin.decide_pending_cleanup(
+            self.state_dir, cleanup_id=pending["id"], decision="delete",
+            confirm="feature", env=self.env,
+        )
+        self.assertFalse(result["resolved"])
+        saved = self.saved_pending(pending)
+        duplicate = plugin.queue_branch_cleanup(self.removed_event(), self.state_dir)
+        self.assertEqual(duplicate["id"], pending["id"])
+        refreshed = self.saved_pending(pending)
+        for key in ("id", "created_at", "repo_root", "branch", "worktree_path",
+                    "branch_outcome", "checkout_outcome"):
+            self.assertEqual(refreshed.get(key), saved.get(key), key)
+        result = plugin.decide_pending_cleanup(
+            self.state_dir, cleanup_id=pending["id"], checkout="keep", env=self.env
+        )
+        self.assertEqual(result["branch_outcome"], "deleted_safely")
+        self.assertEqual(result["checkout_outcome"], "kept")
+        self.assertTrue(result["resolved"])
+
+    def test_requeued_same_id_rejects_stale_ui_approval(self):
+        pending = self.queue_removed_target()
+        replacement = []
+        winner = []
+
+        def answer(prompt):
+            if not replacement:
+                plugin.decide_pending_cleanup(
+                    self.state_dir, cleanup_id=pending["id"], decision="keep", env=self.env
+                )
+                winner.append(self.last_cleanup_result())
+                replacement.append(plugin.queue_branch_cleanup(self.removed_event(), self.state_dir))
+                self.assertEqual(replacement[0]["id"], pending["id"])
+                self.assertNotEqual(replacement[0]["created_at"], pending["created_at"])
+                return "d"
+            return "q"
+
+        self.review_cleanup(pending, answer)
+        self.assertTrue(self.branch_exists("feature"))
+        self.assertEqual(self.saved_pending(pending)["created_at"], replacement[0]["created_at"])
+        self.assertIsNone(self.saved_pending(pending).get("branch_outcome"))
+        self.assertEqual(self.last_cleanup_result(), winner[0])
+
+    def test_resolving_selected_request_does_not_modify_another_id(self):
+        pending = self.queue_removed_target()
+        run(["git", "branch", "other-feature"], cwd=self.source)
+        other = plugin.queue_branch_cleanup(self.removed_event(branch="other-feature"), self.state_dir)
+        saved_other = self.saved_pending(other)
+        plugin.decide_pending_cleanup(
+            self.state_dir, cleanup_id=pending["id"], decision="keep", env=self.env
+        )
+        self.assertEqual(self.saved_pending(other), saved_other)
+        self.assertTrue(self.branch_exists("other-feature"))
+        self.assertEqual([record["id"] for record in plugin.list_pending_cleanups(self.state_dir)], [other["id"]])
+
+    def test_raw_idle_absence_and_external_completion_exit_without_key(self):
+        pending = self.queue_removed_target()
+        oid = run(["git", "rev-parse", "feature"], cwd=self.source).stdout.strip()
+        for external in ("branch", "request"):
+            with self.subTest(external=external):
+                if not self.branch_exists("feature"):
+                    run(["git", "branch", "feature", oid], cwd=self.source)
+                if not plugin.pending_cleanup_path(self.state_dir, pending["id"]).exists():
+                    pending = plugin.queue_branch_cleanup(self.removed_event(), self.state_dir)
+                winner = []
+
+                def timeout(**kwargs):
+                    self.assertEqual(kwargs.get("timeout_seconds"), 1.0)
+                    if external == "branch":
+                        run(["git", "branch", "-D", "feature"], cwd=self.source)
+                    else:
+                        plugin.decide_pending_cleanup(
+                            self.state_dir, cleanup_id=pending["id"], decision="keep", env=self.env
+                        )
+                        winner.append(self.last_cleanup_result())
+                    return None
+
+                with mock.patch.object(plugin.sys.stdin, "isatty", return_value=True):
+                    with mock.patch.object(plugin, "read_single_key", side_effect=timeout) as keys:
+                        result = plugin.review_pending_cleanups(
+                            self.state_dir, cleanup_id=pending["id"],
+                            output_fn=lambda line: None, env=self.env,
+                        )
+                self.assertEqual(result, 0)
+                self.assertEqual(keys.call_count, 1)
+                self.assertFalse(plugin.pending_cleanup_path(self.state_dir, pending["id"]).exists())
+                if winner:
+                    self.assertEqual(self.last_cleanup_result(), winner[0])
+                    self.assertTrue(self.branch_exists("feature"))
+                else:
+                    self.assertEqual(self.last_cleanup_result()["branch_outcome"], "already_absent")
+
+    def test_raw_idle_absence_with_residue_still_requires_checkout_decision(self):
+        pending = self.queue_removed_target(leftover=True)
+        calls = []
+
+        def key(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                run(["git", "branch", "-D", "feature"], cwd=self.source)
+                return None
+            self.assertEqual(self.saved_pending(pending)["branch_outcome"], "already_absent")
+            self.assertTrue((self.target / "ios" / "cache").exists())
+            return "q"
+
+        with mock.patch.object(plugin.sys.stdin, "isatty", return_value=True):
+            with mock.patch.object(plugin, "read_single_key", side_effect=key):
+                plugin.review_pending_cleanups(
+                    self.state_dir, cleanup_id=pending["id"],
+                    output_fn=lambda line: None, env=self.env,
+                )
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self.saved_pending(pending)["branch_outcome"], "already_absent")
+        self.assertIsNone(self.saved_pending(pending).get("checkout_outcome"))
+        self.assertTrue((self.target / "ios" / "cache").exists())
+
+    def test_ui_eof_leaves_undecided_cleanup_pending(self):
+        pending = self.queue_removed_target()
+        self.assertEqual(self.review_cleanup(pending, mock.Mock(side_effect=EOFError)), 0)
+        self.assertTrue(self.branch_exists("feature"))
+        self.assertIsNone(self.saved_pending(pending).get("branch_outcome"))
+
+    def test_inventory_returns_to_parent_after_nested_cleanup(self):
+        pending = self.queue_removed_target()
+        answers = iter(["b", "d", "q"])
+        observed = []
+
+        def answer(prompt):
+            value = next(answers)
+            if value == "q":
+                self.assertFalse(self.branch_exists("feature"))
+                self.assertFalse(plugin.pending_cleanup_path(self.state_dir, pending["id"]).exists())
+                self.assertEqual(self.last_cleanup_result()["branch_outcome"], "deleted_safely")
+            observed.append(value)
+            return value
+
+        result = plugin.manage_worktree_inventory(
+            plugin.resolve_repository(self.source), self.state_dir,
+            env=self.env, input_fn=answer, output_fn=lambda line: None,
+        )
+        self.assertEqual(result, 0)
+        self.assertEqual(observed, ["b", "d", "q"])
+
+    def test_raw_timeout_without_change_does_not_decide_or_delete(self):
+        pending = self.queue_removed_target(leftover=True)
+        before = self.saved_pending(pending)
+        with mock.patch.object(plugin.sys.stdin, "isatty", return_value=True):
+            with mock.patch.object(plugin, "read_single_key", side_effect=[None, "q"]):
+                plugin.review_pending_cleanups(
+                    self.state_dir, cleanup_id=pending["id"],
+                    output_fn=lambda line: None, env=self.env,
+                )
+        self.assertEqual(self.saved_pending(pending), before)
+        self.assertTrue(self.branch_exists("feature"))
+        self.assertTrue((self.target / "ios" / "cache").exists())
+
+    def test_listing_absent_branch_is_observational_until_review(self):
+        pending = self.queue_removed_target()
+        run(["git", "branch", "-D", "feature"], cwd=self.source)
+        before = self.saved_pending(pending)
+        status, document, _ = self.invoke_json(["branch-cleanup", "--list"])
+        self.assertEqual(status, 0)
+        listed, = document["pending"]
+        self.assertFalse(listed["branch_state"]["exists"])
+        self.assertIsNone(listed["branch_outcome"])
+        self.assertEqual(self.saved_pending(pending), before)
+
+    def test_inventory_residue_removal_reconciles_matching_pending_and_returns(self):
+        pending = self.queue_removed_target(leftover=True)
+        partial = plugin.decide_pending_cleanup(
+            self.state_dir, cleanup_id=pending["id"], decision="keep", env=self.env
+        )
+        self.assertFalse(partial["resolved"])
+        answers = iter(["c", "1", self.target.name, "q"])
+        observed = []
+
+        def answer(prompt):
+            value = next(answers)
+            if value == "q":
+                self.assertFalse(self.target.exists())
+                self.assertFalse(plugin.pending_cleanup_path(self.state_dir, pending["id"]).exists())
+                self.assertEqual(self.last_cleanup_result()["branch_outcome"], "kept")
+            observed.append(value)
+            return value
+
+        self.assertEqual(plugin.manage_worktree_inventory(
+            plugin.resolve_repository(self.source), self.state_dir, env=self.env,
+            input_fn=answer, output_fn=lambda line: None,
+        ), 0)
+        self.assertEqual(observed, ["c", "1", self.target.name, "q"])
+        self.assertTrue(self.branch_exists("feature"))
 
 
 if __name__ == "__main__":

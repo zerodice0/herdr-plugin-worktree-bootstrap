@@ -94,6 +94,93 @@ def cleanup_decision_worker(connection, state_dir, cleanup_id, env, *, holder, c
         connection.close()
 
 
+def single_key_pty_worker(connection, event, pending_output_at):
+    """Keep a stalled terminal drain from hanging the parent test suite."""
+    master, slave = pty.openpty()
+    case = unittest.TestCase()
+    case.maxDiff = None
+    output = io.StringIO()
+    original = plugin.termios.tcgetattr(slave)
+    real_select = plugin.select.select
+
+    def assert_restored():
+        restored = plugin.termios.tcgetattr(slave)
+        expected = list(original)
+        # Darwin may set kernel-owned PENDIN when canonical input needs
+        # reprocessing. Compare every other flag and all control characters.
+        pending_input = getattr(plugin.termios, "PENDIN", 0)
+        restored[3] &= ~pending_input
+        expected[3] &= ~pending_input
+        case.assertEqual(restored, expected)
+
+    def queue_output():
+        # No one reads the master: fill the real output queue without blocking.
+        written = 0
+        os.set_blocking(slave, False)
+        try:
+            while True:
+                try:
+                    written += os.write(slave, b"pending output\n" * 1024)
+                except BlockingIOError:
+                    break
+        finally:
+            os.set_blocking(slave, True)
+        case.assertGreater(written, 0)
+
+    def select_with_pending_output(*args):
+        ready = ([slave], [], []) if event in ("eof", "error") else real_select(*args)
+        if pending_output_at == "restore":
+            queue_output()
+        return ready
+
+    try:
+        if event == "enter":
+            os.write(master, b"\n")
+        elif event == "queued":
+            os.write(master, b"D\n")
+        if pending_output_at == "entry":
+            queue_output()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(
+                plugin.select, "select", side_effect=select_with_pending_output
+            ))
+            if event == "eof":
+                stack.enter_context(mock.patch.object(plugin.os, "read", return_value=b""))
+            elif event == "error":
+                stack.enter_context(mock.patch.object(
+                    plugin.os, "read", side_effect=OSError("fixture read failure")
+                ))
+            if event in ("eof", "error"):
+                with case.assertRaises(EOFError if event == "eof" else OSError):
+                    plugin.read_single_key(
+                        input_fd=slave, output_stream=output, timeout_seconds=0
+                    )
+            else:
+                value = plugin.read_single_key(
+                    input_fd=slave, output_stream=output, timeout_seconds=0.01
+                )
+                case.assertEqual(
+                    value, {"timeout": None, "enter": "", "queued": "D"}[event]
+                )
+            assert_restored()
+        if event == "queued":
+            # The first mode switch and restoration must leave the next key intact.
+            case.assertEqual(plugin.read_single_key(
+                input_fd=slave, output_stream=output, timeout_seconds=0
+            ), "")
+            assert_restored()
+        case.assertEqual(
+            output.getvalue(), "\033[?25l\033[?25h" * (2 if event == "queued" else 1)
+        )
+        connection.send(("ok", None))
+    except Exception as exc:
+        connection.send(("error", str(exc)))
+    finally:
+        os.close(master)
+        os.close(slave)
+        connection.close()
+
+
 class PathValidationTests(unittest.TestCase):
     def test_copy_list_supports_comments_spaces_unicode_crlf_and_dot_names(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -467,40 +554,36 @@ accent = "cyan"
                     os.close(slave)
 
     def test_single_key_timeout_enter_and_eof_are_distinct_and_restore_terminal(self):
-        for event in ("timeout", "enter", "eof", "error"):
-            with self.subTest(event=event):
-                master, slave = pty.openpty()
-                output = io.StringIO()
-                original = plugin.termios.tcgetattr(slave)
-                try:
-                    if event == "enter":
-                        os.write(master, b"\n")
-                    with contextlib.ExitStack() as stack:
-                        if event == "eof":
-                            stack.enter_context(mock.patch.object(plugin.os, "read", return_value=b""))
-                        elif event == "error":
-                            stack.enter_context(mock.patch.object(
-                                plugin.os, "read", side_effect=OSError("fixture read failure")
-                            ))
-                        if event in ("eof", "error"):
-                            stack.enter_context(mock.patch.object(
-                                plugin.select, "select", return_value=([slave], [], [])
-                            ))
-                            with self.assertRaises(EOFError if event == "eof" else OSError):
-                                plugin.read_single_key(
-                                    input_fd=slave, output_stream=output, timeout_seconds=0
-                                )
-                        else:
-                            value = plugin.read_single_key(
-                                input_fd=slave, output_stream=output,
-                                timeout_seconds=1 if event == "enter" else 0,
-                            )
-                            self.assertEqual(value, "" if event == "enter" else None)
-                    self.assertEqual(plugin.termios.tcgetattr(slave), original)
-                    self.assertTrue(output.getvalue().endswith("\033[?25h"))
-                finally:
-                    os.close(master)
-                    os.close(slave)
+        context = multiprocessing.get_context("spawn")
+        for event in ("timeout", "enter", "queued", "eof", "error"):
+            for pending_output_at in ("entry", "restore"):
+                with self.subTest(event=event, pending_output_at=pending_output_at):
+                    parent, child = context.Pipe()
+                    process = context.Process(
+                        target=single_key_pty_worker,
+                        args=(child, event, pending_output_at),
+                    )
+                    try:
+                        process.start()
+                        child.close()
+                        self.assertTrue(
+                            parent.poll(10),
+                            "single-key read stalled with undrained PTY output",
+                        )
+                        status, detail = parent.recv()
+                        self.assertEqual(status, "ok", detail)
+                        process.join(5)
+                        self.assertEqual(process.exitcode, 0)
+                    finally:
+                        parent.close()
+                        child.close()
+                        if process.is_alive():
+                            process.terminate()
+                        process.join(5)
+                        if process.is_alive():
+                            process.kill()
+                            process.join(5)
+                        process.close()
 
     def test_cleanup_choice_supports_enter_escape_and_korean_layout_keys(self):
         self.assertEqual(plugin.normalize_cleanup_choice(""), "")

@@ -2758,7 +2758,9 @@ def read_single_key(
     stream.write("\033[?25l")
     stream.flush()
     try:
-        termios.tcsetattr(file_descriptor, termios.TCSADRAIN, new_attributes)
+        # Input-mode changes must not wait for output the terminal consumer has
+        # not drained. Apply immediately without discarding queued keystrokes.
+        termios.tcsetattr(file_descriptor, termios.TCSANOW, new_attributes)
         if timeout_seconds is not None and not select.select(
             [file_descriptor], [], [], timeout_seconds
         )[0]:
@@ -2794,7 +2796,7 @@ def read_single_key(
         return character
     finally:
         try:
-            termios.tcsetattr(file_descriptor, termios.TCSADRAIN, old_attributes)
+            termios.tcsetattr(file_descriptor, termios.TCSANOW, old_attributes)
         finally:
             stream.write("\033[?25h")
             stream.flush()

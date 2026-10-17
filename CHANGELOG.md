@@ -9,6 +9,7 @@ All notable changes to this project are documented here.
 - Preserve independent branch and checkout decisions across concurrent reviewers and partial failures without recreating completed requests.
 - Report `already_absent` when a branch was removed elsewhere instead of claiming safe or forced deletion.
 - Clarify standalone review completion, intentionally persistent Inventory, and single-owner headless cleanup with bounded asynchronous-event retries and explicit completion checks.
+- Apply single-key input mode changes and restoration without draining terminal output, preventing macOS review-menu hangs while preserving queued keys.
 
 ## [0.6.0] - 2026-10-16
 

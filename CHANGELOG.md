@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented here.
 
+## [0.6.1] - 2026-10-17
+
+- Reconcile idle real-TTY branch and leftover-file review menus every second so external changes and completed requests no longer require a keypress to be noticed.
+- Preserve typed confirmations without refresh and require fresh review when the displayed branch commit, checkout identity, or cleanup request changes.
+- Preserve independent branch and checkout decisions across concurrent reviewers and partial failures without recreating completed requests.
+- Report `already_absent` when a branch was removed elsewhere instead of claiming safe or forced deletion.
+- Clarify standalone review completion, intentionally persistent Inventory, and single-owner headless cleanup with bounded asynchronous-event retries and explicit completion checks.
+- Apply single-key input mode changes and restoration without draining terminal output, preventing macOS review-menu hangs while preserving queued keys.
+
 ## [0.6.0] - 2026-10-16
 
 - Add read-only `status --json` and `inventory --json` responses with a versioned envelope and machine-readable errors.

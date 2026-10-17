@@ -29,6 +29,8 @@ def main() -> int:
         action_target = root / "action-target"
         event_target = root / "event-target"
         state = root / "state"
+        config = root / "plugin-config"
+        config.mkdir()
         run("git", "init", "-q", os.fspath(source))
         run("git", "config", "user.name", "Smoke Test", cwd=source)
         run("git", "config", "user.email", "smoke@example.com", cwd=source)
@@ -51,6 +53,7 @@ def main() -> int:
                 }
             ),
             "HERDR_PLUGIN_STATE_DIR": os.fspath(state),
+            "HERDR_PLUGIN_CONFIG_DIR": os.fspath(config),
         }
         if plugin.main(["sync"], env=action_env) != 0:
             raise RuntimeError("action-context smoke invocation failed")
@@ -63,6 +66,7 @@ def main() -> int:
                 {"data": {"worktree": {"path": os.fspath(event_target)}}}
             ),
             "HERDR_PLUGIN_STATE_DIR": os.fspath(state),
+            "HERDR_PLUGIN_CONFIG_DIR": os.fspath(config),
         }
         if plugin.main(["bootstrap"], env=event_env) != 0:
             raise RuntimeError("event-context smoke invocation failed")
@@ -71,6 +75,7 @@ def main() -> int:
         run("git", "worktree", "remove", os.fspath(event_target), cwd=source)
         removed_env = {
             "HERDR_PLUGIN_EVENT": "worktree.removed",
+            "HERDR_PLUGIN_CONFIG_DIR": os.fspath(config),
             "HERDR_PLUGIN_EVENT_JSON": json.dumps(
                 {
                     "event": "worktree.removed",
@@ -101,12 +106,28 @@ def main() -> int:
                 }
             ),
         }
-        plugin.handle_branch_cleanup_event(removed_env, state, open_popup=False)
-        plugin.review_pending_cleanups(
+        pending = plugin.handle_branch_cleanup_event(removed_env, state, open_popup=False)
+        if not plugin.pending_cleanup_path(state, pending["id"]).exists():
+            raise RuntimeError("removal event did not retain its pending cleanup")
+        review_result = plugin.review_pending_cleanups(
             state,
             input_fn=lambda prompt: "d",
             output_fn=lambda line: None,
         )
+        if review_result != 0:
+            raise RuntimeError("cleanup review did not complete successfully")
+        if plugin.list_pending_cleanups(state):
+            raise RuntimeError("completed cleanup left a pending request")
+        result = json.loads(
+            (state / plugin.BRANCH_CLEANUP_DIR / "last-result.json").read_text(encoding="utf-8")
+        )
+        if (
+            result.get("id") != pending["id"]
+            or result.get("branch_outcome") != "deleted_safely"
+            or result.get("checkout_outcome") != "absent"
+            or result.get("outcome") != "deleted_safely"
+        ):
+            raise RuntimeError("cleanup persisted an incorrect branch or checkout outcome")
         branch_check = subprocess.run(
             ["git", "-C", os.fspath(source), "show-ref", "--verify", "--quiet", "refs/heads/event-smoke"],
             check=False,

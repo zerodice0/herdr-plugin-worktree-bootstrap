@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented here.
 
-## [Unreleased]
+## [0.6.1] - 2026-10-17
 
 - Reconcile idle real-TTY branch and leftover-file review menus every second so external changes and completed requests no longer require a keypress to be noticed.
 - Preserve typed confirmations without refresh and require fresh review when the displayed branch commit, checkout identity, or cleanup request changes.

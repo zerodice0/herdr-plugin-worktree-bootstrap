@@ -19,7 +19,7 @@ The plugin supports Herdr 0.7.0 or newer on Linux and macOS. It requires Python 
 Install the tagged release from GitHub:
 
 ```sh
-herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.6.0
+herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.6.1
 ```
 
 For local development, link this checkout:
@@ -399,7 +399,7 @@ Before validation, find and disable the old plugin:
 ```sh
 herdr plugin list
 herdr plugin disable OLD_PLUGIN_ID
-herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.6.0
+herdr plugin install zerodice0/herdr-plugin-worktree-bootstrap --ref v0.6.1
 ```
 
 To roll back, disable this plugin and re-enable the previous one. Control files are left untouched:
